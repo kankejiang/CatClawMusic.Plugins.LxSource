@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>CatClawMusic.Plugins.LxSource</RootNamespace>
+    <AssemblyName>CatClawMusic.Plugins.LxSource</AssemblyName>
+    <!-- 插件以独立 DLL 交付，不携带依赖（Core/MAUI 由宿主提供） -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- tools/ 下的测试工程（SmokeTest 等）不进插件编译（否则其 obj 生成物会被默认 **/*.cs 通配卷进来） -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tools\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 注意：本项目位于 D:\Code\CatClawMusic.Plugins.LxSource，CatClawMusic.Core 在其同级
+         CatClawMusic\ 目录下，因此相对路径为 ..\CatClawMusic\CatClawMusic.Core -->
+    <ProjectReference Include="..\CatClawMusic\CatClawMusic.Core\CatClawMusic.Core.csproj" />
+    <!-- 引用 MAUI Controls：插件用 C# 代码构建 UI（不用 XAML，避免跨程序集编译问题）。
+         版本与宿主一致（10.0.20），CopyLocalLockFileAssemblies=false 保证不随插件分发。 -->
+    <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
+    <!-- MVVM Toolkit：插件 ViewModel 使用 ObservableObject/RelayCommand -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 客户端只认 .ccp 插件包：构建后把程序集复制为 .ccp 作为发布产物 -->
+    <None Include="$(TargetPath)" Pack="false" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
+  <Target Name="PackageCcp" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFiles="$(OutDir)CatClawMusic.Plugins.LxSource.ccp"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
