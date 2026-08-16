@@ -59,7 +59,7 @@ dotnet build -c Release
 dotnet run -c Release --project tools/SmokeTest
 ```
 
-本地模拟 lx-music-api-server 服务，覆盖协议客户端解析（interval 三种形态 / 分段直链 / 封面数组兜底 / 三流歌词合并 / code≠0 处理）与插件程序集端到端链路（反射加载真实 DLL，34 项断言全过）。
+本地模拟 lx-music-api-server 服务，覆盖协议客户端解析（interval 三种形态 / 分段直链 / 封面数组兜底 / 三流歌词合并与 ±100ms 容差 / 网易冒号时间标签变体 / code≠0 处理）与插件程序集端到端链路（反射加载真实 DLL，38 项断言全过）。
 
 ## 协议
 

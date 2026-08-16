@@ -47,10 +47,11 @@ var serverTask = Task.Run(async () =>
                     : Encoding.UTF8.GetBytes("{\"code\":0,\"data\":{\"url\":\"http://media.example.com/p1.jpg\",\"size\":300}}");
                 break;
             case "/lyric":
+                // 译文/罗马音时间戳故意偏移 30~50ms（模拟真实网易返回，验证容差合并）
                 body = Encoding.UTF8.GetBytes(
                     "{\"code\":0,\"data\":{\"lrc\":\"[00:00.00]第一句\\n[00:05.00]第二句\\n[01:00.00]副歌\"," +
-                    "\"tlyric\":\"[00:00.00]First line\\n[00:05.00]Second line\"," +
-                    "\"rlyric\":\"[00:00.00]Daiichi ku\\n[00:05.00]Daini ku\"}}");
+                    "\"tlyric\":\"[00:00.05]First line\\n[00:05.05]Second line\"," +
+                    "\"rlyric\":\"[00:00.03]Daiichi ku\\n[00:05.03]Daini ku\"}}");
                 break;
             default:
                 ctx.Response.StatusCode = 404;
@@ -107,12 +108,24 @@ try
     var lyric = await client.GetLyricsAsync(songs[0]);
     Check("GetLyricsAsync 三流非空", lyric is { Lrc.Length: > 0, TLrc.Length: > 0, RLrc.Length: > 0 });
 
-    // 7. 歌词合并解析（译文 + 罗马音按时间戳挂行）
+    // 7. 歌词合并解析（译文 + 罗马音按时间戳挂行，含 ±100ms 容差）
     var parsed = LxLrcParser.Parse(lyric!.Value.Lrc!, lyric.Value.TLrc, lyric.Value.RLrc);
     Check("LxLrcParser 解析 3 行", parsed is { Lines.Count: 3 });
-    Check("译文挂载", parsed!.Lines[0].Translation == "First line", parsed.Lines[0].Translation);
-    Check("罗马音挂载", parsed.Lines[0].Roma == "Daiichi ku", parsed.Lines[0].Roma);
+    Check("译文挂载（50ms 容差）", parsed!.Lines[0].Translation == "First line", parsed.Lines[0].Translation);
+    Check("罗马音挂载（30ms 容差）", parsed.Lines[0].Roma == "Daiichi ku", parsed.Lines[0].Roma);
     Check("无歌词行不挂翻译", parsed.Lines[2].Translation is null, parsed.Lines[2].Translation ?? "(null)");
+
+    // 7b. 网易系时间标签冒号变体 "[mm:ss:xx]" 归一化（对照官方 fixTimeLabel：末两位是百分秒）
+    var colonLrc = LxLrcParser.Parse("[00:12:34]冒号变体\n[01:02:03]百分秒", "[00:17:00]译文差4.7秒不挂", null);
+    Check("冒号变体 [00:12:34] → 12.34s", colonLrc is { Lines.Count: 2 } && colonLrc.Lines[0].Timestamp == TimeSpan.FromMilliseconds(12340),
+        colonLrc?.Lines[0].Timestamp.ToString() ?? "null");
+    Check("[01:02:03] → 62.03s", colonLrc!.Lines[1].Timestamp == TimeSpan.FromMilliseconds(62030),
+        colonLrc.Lines[1].Timestamp.ToString());
+    Check("超容差译文不误挂", colonLrc.Lines[0].Translation is null);
+
+    // 7c. 超容差（300ms）不合并
+    var farLrc = LxLrcParser.Parse("[00:00.00]原文", "[00:00.30]差300ms", null);
+    Check("300ms 超容差不挂译文", farLrc!.Lines[0].Translation is null, farLrc.Lines[0].Translation ?? "(null)");
 
     // 8. code!=0 → null
     var err = await client.SearchAsync("error", 1, 20, null);
