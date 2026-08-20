@@ -78,10 +78,13 @@ public static class LxUiKit
         {
             var pointer = new PointerGestureRecognizer();
             var cts = new CancellationTokenSource();
-            pointer.PointerPressed += (_, _) =>
+            Point? pressedPos = null;
+            const double moveThreshold = 20;  // 移动超过该像素视为滚动/拖拽，取消长按
+            pointer.PointerPressed += (_, e) =>
             {
                 cts.Cancel();
                 cts = new CancellationTokenSource();
+                pressedPos = e.GetPosition(root);
                 var ct = cts.Token;
                 _ = Task.Delay(500, ct).ContinueWith(_ =>
                 {
@@ -92,6 +95,15 @@ public static class LxUiKit
                             longPressCommand.Execute(root.BindingContext);
                     });
                 }, ct);
+            };
+            // 拖动/滚动时手指会移动 → 超过阈值取消长按计时（否则滚动列表误触菜单）
+            pointer.PointerMoved += (_, e) =>
+            {
+                if (cts.IsCancellationRequested || pressedPos is not { } p0) return;
+                var p1 = e.GetPosition(root);
+                if (p1 is not { } p) return;
+                if (Math.Abs(p.X - p0.X) > moveThreshold || Math.Abs(p.Y - p0.Y) > moveThreshold)
+                    cts.Cancel();
             };
             pointer.PointerReleased += (_, _) => cts.Cancel();
             root.GestureRecognizers.Add(pointer);
