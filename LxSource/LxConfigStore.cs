@@ -5,17 +5,17 @@ namespace CatClawMusic.Plugins.LxSource;
 /// <summary>LX 源插件配置（JSON 持久化到宿主数据目录）</summary>
 public class LxConfig
 {
-    /// <summary>lx-music-api-server 地址（如 http://127.0.0.1:3000）</summary>
-    public string ServerUrl { get; set; } = "";
+    /// <summary>lx-music 自定义源 .js 在线地址（空 = 未在线导入）</summary>
+    public string ScriptUrl { get; set; } = "";
+
+    /// <summary>lx-music 自定义源 .js 本地文件路径（空 = 未本地导入）</summary>
+    public string ScriptFilePath { get; set; } = "";
 
     /// <summary>音质档位：0=标准 128k，1=高品 320k，2=无损 FLAC</summary>
     public int QualityLevel { get; set; } = 1;
 
-    /// <summary>默认音源标识（空 = 服务器默认；如 netease/qq/kuwo/kugou/migu/bilibili）</summary>
+    /// <summary>默认音源标识（空 = 自动，用脚本声明的第一个源；如 netease/qq/kuwo/kugou/migu）</summary>
     public string DefaultSource { get; set; } = "";
-
-    /// <summary>lx-music 自定义源 .js 脚本地址（空 = 不启用脚本源，纯走 server）</summary>
-    public string ScriptUrl { get; set; } = "";
 }
 
 /// <summary>配置读写：{LocalApplicationData}/CatClawMusic.Maui/lx_source_config.json</summary>

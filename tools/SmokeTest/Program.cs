@@ -172,8 +172,8 @@ try
     Check("未配置服务器 Ping=false", !await empty.PingAsync());
     Check("未配置服务器 Search=null", await empty.SearchAsync("x", 1, 20, null) == null);
 
-    // ── 阶段 2：反射加载真实插件 DLL，验证入口类全链路 ──
-    Console.WriteLine("\n[phase2] 加载真实插件程序集 CatClawMusic.Plugins.LxSource.dll");
+    // ── 阶段 2：反射加载真实插件 DLL（脚本模式），验证入口类全链路 ──
+    Console.WriteLine("\n[phase2] 加载真实插件程序集 + 脚本模式（嵌入 Jint 经 AssemblyResolve 加载）");
     var coreAsm = typeof(CatClawMusic.Core.Models.OnlineSong).Assembly;
     AppDomain.CurrentDomain.AssemblyResolve += (_, e) =>
         new AssemblyName(e.Name).Name == coreAsm.GetName().Name ? coreAsm : null;
@@ -190,50 +190,47 @@ try
 
     var lxPlugin = (CatClawMusic.Core.Interfaces.IOnlineMusicPlugin)plugin;
     var lxLyricProvider = (CatClawMusic.Core.Interfaces.ILyricsProviderPlugin)plugin;
-    // 通过公开方法配置服务器（dynamic 调用避免引插件程序集）
-    ((dynamic)plugin).SaveConfig($"http://127.0.0.1:{Port}", 1, "netease", "");
-
-    var onlineSongs = await lxPlugin.SearchAsync("test", 1, 5);
-    Check("插件 SearchAsync 返回 3 首", onlineSongs is { Count: 3 });
-    Check("复合 Id source:id", onlineSongs![0].Id == "netease:S1", onlineSongs[0].Id);
-    Check("Platform=lx", onlineSongs[0].Platform == "lx");
-    Check("DurationMs=240000", onlineSongs[0].DurationMs == 240000, onlineSongs[0].DurationMs.ToString());
-    Check("封面已解析", onlineSongs[0].CoverUrl == "http://media.example.com/p1.jpg", onlineSongs[0].CoverUrl);
-    Check("bilibili 曲目复合 Id", onlineSongs[2].Id == "bilibili:S3", onlineSongs[2].Id);
-    Check("搜索失败返回 null", await lxPlugin.SearchAsync("error", 1, 5) == null);
-
-    var playUrl = await lxPlugin.GetPlayUrlAsync(onlineSongs[0], 1);
-    Check("插件 GetPlayUrlAsync(320)", playUrl == "http://media.example.com/u1_320.mp3", playUrl);
-
-    // RemoteId 路由：宿主歌词兜底链的入口（形如 "lx:netease:S1"）
-    var lrc = await lxLyricProvider.GetLyricsAsync(new CatClawMusic.Core.Models.Song
-    {
-        Title = "Test Song",
-        Artist = "Tester",
-        RemoteId = "lx:netease:S1",
-    });
-    Check("歌词兜底链命中 RemoteId 路由", lrc is { Lines.Count: 3 });
-    Check("兜底链译文+罗马音挂载", lrc!.Lines[0].Translation == "First line" && lrc.Lines[0].Roma == "Daiichi ku",
-        $"T={lrc.Lines[0].Translation} R={lrc.Lines[0].Roma}");
-    var other = await lxLyricProvider.GetLyricsAsync(new CatClawMusic.Core.Models.Song
-    {
-        Title = "x",
-        RemoteId = "netease:123",
-    });
-    Check("非 lx: 前缀不拦截", other == null);
-
-    // ── 阶段 2b：脚本源通过真实插件端到端（验证嵌入 Jint 在插件 DLL 上下文加载）──
-    Console.WriteLine("\n[phase2b] 脚本源经真实插件（嵌入 Jint + AssemblyResolve）");
     dynamic dplugin = plugin;
+
+    // 加载 mock 脚本（验证嵌入 Jint 在插件 DLL 上下文经 AssemblyResolve 加载）
     bool scriptOk = await dplugin.LoadScriptAsync($"http://127.0.0.1:{Port}/script.js");
     Check("插件加载脚本源", scriptOk);
     Check("插件 ScriptReady", (bool)dplugin.ScriptReady);
-    // 重新搜索（server 模式，netease 曲目）→ 该曲 GetPlayUrlAsync 应走脚本（wy_320）而非 server（u1_320）
-    var onlineSongs2 = await lxPlugin.SearchAsync("test", 1, 5);
-    Check("脚本模式搜索仍返回 3 首", onlineSongs2 is { Count: 3 });
-    var scriptPlayUrl = await lxPlugin.GetPlayUrlAsync(onlineSongs2![0], 1);
-    Check("播放直链走脚本（wy_320 而非 server u1_320）",
-        scriptPlayUrl == "http://media.example.com/wy_320.mp3", scriptPlayUrl);
+    Check("ILyricsProviderPlugin.IsAvailable", ((CatClawMusic.Core.Interfaces.ILyricsProviderPlugin)plugin).IsAvailable);
+
+    // SearchAsync：mock 脚本不支持 musicSearch → 返回 null
+    var searchResult = await lxPlugin.SearchAsync("test", 1, 5);
+    Check("脚本不支持 musicSearch 返回 null", searchResult == null);
+
+    // GetPlayUrlAsync：构造 netease 歌曲测试（搜索不可用，直接构造 OnlineSong）
+    var testSong = new CatClawMusic.Core.Models.OnlineSong
+    {
+        Id = "netease:S1",
+        Platform = "lx",
+        Title = "Test",
+        Artist = "Tester",
+        DurationMs = 240000,
+        Internal = new Dictionary<string, object> { ["Source"] = "netease", ["RawId"] = "S1" },
+    };
+    var scriptPlayUrl = await lxPlugin.GetPlayUrlAsync(testSong, 1);
+    Check("播放直链走脚本（wy_320）", scriptPlayUrl == "http://media.example.com/wy_320.mp3", scriptPlayUrl);
+
+    // 不支持的源 → null（bilibili 不在脚本声明里）
+    var unsupportedSong = new CatClawMusic.Core.Models.OnlineSong
+    {
+        Id = "bilibili:X9", Platform = "lx", Title = "x", Artist = "y",
+        Internal = new Dictionary<string, object> { ["Source"] = "bilibili", ["RawId"] = "X9" },
+    };
+    var unsupportedUrl = await lxPlugin.GetPlayUrlAsync(unsupportedSong, 1);
+    Check("脚本不支持的源返回 null", unsupportedUrl == null);
+
+    // RemoteId 路由：lx: 前缀命中路由（脚本不支持 lyric → null）；非 lx: 前缀直接 null
+    var lrcRouted = await lxLyricProvider.GetLyricsAsync(new CatClawMusic.Core.Models.Song
+    { Title = "Test", Artist = "Tester", RemoteId = "lx:netease:S1" });
+    Check("lx: 前缀命中路由（脚本无 lyric → null）", lrcRouted == null);
+    var other = await lxLyricProvider.GetLyricsAsync(new CatClawMusic.Core.Models.Song
+    { Title = "x", RemoteId = "netease:123" });
+    Check("非 lx: 前缀不拦截", other == null);
 
     // ── 阶段 3：Jint 脚本引擎 + lx 自定义源 .js（验证 musicUrl 全链路）──
     Console.WriteLine("\n[phase3] Jint 脚本引擎：lx 自定义源 .js");
@@ -259,7 +256,7 @@ on(EVENT_NAMES.request, ({ action, source, info }) => {
 send(EVENT_NAMES.inited, { status: true, sources: musicSources });
 """;
     var host = new LxScriptHost();
-    Check("脚本加载+inited", host.Run(mockJs));
+    Check("脚本加载+inited", await host.RunAsync(mockJs));
     Check("脚本声明 5 个源", host.Sources is { SourceCodes.Count: 5 }, host.Sources?.SourceCodes.Count.ToString());
     Check("脚本支持 wy/musicUrl", host.Supports("wy", "musicUrl"));
     Check("脚本不支持 wy/musicSearch", !host.Supports("wy", "musicSearch"));
@@ -273,6 +270,34 @@ send(EVENT_NAMES.inited, { status: true, sources: musicSources });
     Check("netease→wy", LxPlatformCodes.ToShort("netease") == "wy");
     Check("tx→qq", LxPlatformCodes.ToFull("tx") == "qq");
     Check("bilibili 未知码直传", LxPlatformCodes.ToShort("bilibili") == "bilibili");
+
+    // ── 阶段 4：真实混淆脚本加载（长青SVIP v1.2.0，若文件存在）──
+    var realScriptPath = @"C:\Users\lvjin\AppData\Local\Temp\长青SVIP音源(二改修复版) v1.2.0.js";
+    if (File.Exists(realScriptPath))
+    {
+        Console.WriteLine("\n[phase4] 真实混淆脚本加载（长青SVIP v1.2.0）");
+        var realHost = new LxScriptHost();
+        var realOk = await realHost.LoadFromFileAsync(realScriptPath);
+        // 脚本有 checkUpdate：可能 inited 正常，或检测到新版发 updateAlert
+        Check("混淆脚本 inited 或有更新提示", realOk || realHost.HasUpdateAlert, realHost.LastError);
+        if (realOk)
+        {
+            Check("混淆脚本声明 4 源", realHost.Sources is { SourceCodes.Count: 4 },
+                realHost.Sources?.SourceCodes.Count.ToString());
+            Check("混淆脚本支持 wy/musicUrl", realHost.Supports("wy", "musicUrl"));
+            Check("混淆脚本支持 kg/musicUrl", realHost.Supports("kg", "musicUrl"));
+            Check("混淆脚本支持 tx/musicUrl", realHost.Supports("tx", "musicUrl"));
+            Check("混淆脚本支持 kw/musicUrl", realHost.Supports("kw", "musicUrl"));
+        }
+        else if (realHost.HasUpdateAlert)
+        {
+            Console.WriteLine($"  (脚本检测到新版：{realHost.UpdateMessage} → 跳过源声明检查)");
+        }
+    }
+    else
+    {
+        Console.WriteLine("\n[phase4] 跳过（未找到长青SVIP 脚本文件）");
+    }
 }
 finally
 {

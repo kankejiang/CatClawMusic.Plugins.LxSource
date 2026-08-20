@@ -4,32 +4,29 @@ using CatClawMusic.Core.Models;
 namespace CatClawMusic.Plugins.LxSource;
 
 /// <summary>
-/// LX 源音乐插件：兼容 lx-music-api-server 协议，一个可配置的服务器地址即可接入任意
-/// LX 音乐源（网易云 / QQ / 酷我 / 酷狗 / 咪咕 / 哔哩哔哩 等），覆盖搜索 / 播放直链 /
-/// 歌词（原文 + 译文 + 罗马音三流）/ 封面 / 多音质。
+/// LX 源音乐插件：内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本，支持在线导入与本地导入。
+/// 脚本声明源（kg/tx/wy/kw 等）与 action（musicUrl/musicSearch/lyric/pic），插件按声明分发。
 /// <para>
-/// 同时实现 <see cref="IViewContributorPlugin"/>：向宿主贡献完整的"LX 源音乐"入口页面
-/// （服务器配置 + 搜索 + 播放），以及 <see cref="ILyricsProviderPlugin"/>：让宿主歌词
-/// 兜底链能消费 lx 在线歌词（RemoteId 形如 "lx:source:id"）。
+/// 实现 <see cref="IViewContributorPlugin"/>：贡献「LX 源音乐」入口页面（脚本导入 + 搜索 + 播放），
+/// <see cref="ILyricsProviderPlugin"/>：宿主歌词兜底链按 RemoteId（"lx:source:id"）路由。
 /// </para>
 /// </summary>
 public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyricsProviderPlugin
 {
-    private readonly LxApiClient _client = new();
     private LxConfig _config = new();
     private LxScriptHost? _script;
 
     /// <summary>整页 VM 插件级单例（配置与搜索状态跨页面保留）</summary>
     private static LxOnlineMusicViewModel? _sharedVm;
 
-    /// <summary>封面并发上限（保护公共镜像服务器免被搜索页 N 个 /pic 请求打爆限流）</summary>
+    /// <summary>封面并发上限（保护脚本 API 免被搜索页 N 个 pic 请求打爆限流）</summary>
     private static readonly SemaphoreSlim CoverGate = new(4, 4);
 
     public string PluginId => "lxSource";
     public string Name => "LX 源音乐";
-    public string Version => "0.2.0";
+    public string Version => "0.3.0";
     public string Author => "CatClawMusic";
-    public string Description => "兼容 lx-music-api-server 协议 + lx-music 自定义源 .js 脚本：服务器地址或 .js 源二选一/互补接入，搜索/播放/歌词（原文+翻译+罗马音）/封面/多音质";
+    public string Description => "内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本（在线/本地导入）：支持网易云/QQ/酷我/酷狗等，播放直链/歌词（原文+翻译+罗马音）/封面/多音质";
     public List<string> Capabilities => new() { "search", "play", "lyrics", "roma", "quality", "script" };
 
     /// <summary>来源平台标识（RemoteId 前缀 "lx:"）</summary>
@@ -37,20 +34,15 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     // ── IViewContributorPlugin ──
 
-    /// <summary>发现页入口显示标题</summary>
     public string EntryTitle => "LX 源音乐";
-
-    /// <summary>发现页入口图标（emoji 兼容）</summary>
     public string EntryIcon => "🎵";
 
-    /// <summary>创建入口页面实例（宿主 Push 到导航栈）</summary>
     public object CreateEntryPage(IServiceProvider services)
     {
         var vm = GetSharedVm(services);
         return new LxOnlineMusicPage(vm, services);
     }
 
-    /// <summary>获取插件级单例 VM（入口页面共用一份配置与搜索状态）</summary>
     private LxOnlineMusicViewModel GetSharedVm(IServiceProvider services)
     {
         if (_sharedVm != null) return _sharedVm;
@@ -58,18 +50,19 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return _sharedVm;
     }
 
-    // ── 生命周期与配置（插件 UI 调用）──
+    // ── 生命周期与配置 ──
 
     public Task InitializeAsync()
     {
         _config = LxConfigStore.Load();
-        _client.SetServerUrl(_config.ServerUrl);
-        if (!string.IsNullOrWhiteSpace(_config.ScriptUrl))
+        // 恢复上次导入的脚本（本地优先，文件不在则试在线地址）
+        if (!string.IsNullOrWhiteSpace(_config.ScriptFilePath) && File.Exists(_config.ScriptFilePath))
+            _ = LoadScriptFromFileAsync(_config.ScriptFilePath);
+        else if (!string.IsNullOrWhiteSpace(_config.ScriptUrl))
             _ = LoadScriptAsync(_config.ScriptUrl);
         return Task.CompletedTask;
     }
 
-    /// <summary>关闭：释放插件级单例 VM 与脚本宿主。</summary>
     public Task ShutdownAsync()
     {
         _sharedVm = null;
@@ -78,11 +71,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return Task.CompletedTask;
     }
 
-    /// <summary>当前配置（插件 UI 读写）</summary>
     public LxConfig Config => _config;
-
-    /// <summary>HTTP 客户端（连接测试用）</summary>
-    public LxApiClient Client => _client;
 
     /// <summary>脚本宿主（UI 查询加载状态/源能力用）</summary>
     public LxScriptHost? Script => _script;
@@ -90,7 +79,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     /// <summary>脚本源是否就绪（已加载并声明了源）</summary>
     public bool ScriptReady => _script?.IsLoaded == true;
 
-    /// <summary>加载 .js 脚本源（后台拉取+执行；成功后 GetPlayUrlAsync 等会优先走脚本）</summary>
+    /// <summary>在线导入：下载 .js 并执行</summary>
     public async Task<bool> LoadScriptAsync(string jsUrl)
     {
         if (string.IsNullOrWhiteSpace(jsUrl))
@@ -105,28 +94,32 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return ok;
     }
 
-    /// <summary>保存配置并立即生效（校验由 UI 完成）</summary>
-    public void SaveConfig(string serverUrl, int qualityLevel, string defaultSource, string scriptUrl)
+    /// <summary>本地导入：读取本地 .js 文件并执行</summary>
+    public async Task<bool> LoadScriptFromFileAsync(string filePath)
     {
-        _config.ServerUrl = (serverUrl ?? "").Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            _script?.Dispose();
+            _script = null;
+            return false;
+        }
+        _script ??= new LxScriptHost();
+        var ok = await _script.LoadFromFileAsync(filePath);
+        if (!ok) _script = null;
+        return ok;
+    }
+
+    /// <summary>保存配置（音质 + 默认源 + 脚本地址/路径）</summary>
+    public void SaveConfig(int qualityLevel, string defaultSource, string scriptUrl, string scriptFilePath)
+    {
         _config.QualityLevel = Math.Clamp(qualityLevel, 0, 2);
         _config.DefaultSource = defaultSource ?? "";
         _config.ScriptUrl = (scriptUrl ?? "").Trim();
-        _client.SetServerUrl(_config.ServerUrl);
+        _config.ScriptFilePath = (scriptFilePath ?? "").Trim();
         LxConfigStore.Save(_config);
-        if (!string.IsNullOrWhiteSpace(_config.ScriptUrl))
-            _ = LoadScriptAsync(_config.ScriptUrl);
     }
 
-    /// <summary>音质档位 → lx 协议 br 参数（0=128k 1=320k 2=FLAC）</summary>
-    public static string BrForQuality(int quality) => quality switch
-    {
-        0 => "128",
-        1 => "320",
-        _ => "flac",
-    };
-
-    /// <summary>音质档位 → lx 自定义源脚本 quality 字符串（带 k 后缀）</summary>
+    /// <summary>音质档位 → lx 自定义源脚本 quality 字符串（0=128k 1=320k 2=FLAC）</summary>
     public static string LxQualityFor(int quality) => quality switch
     {
         0 => "128k",
@@ -136,81 +129,53 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     // ── IOnlineMusicPlugin ──
 
-    /// <summary>搜索歌曲（结果带封面；优先脚本 musicSearch，回落 server）。失败返回 null</summary>
+    /// <summary>搜索歌曲（结果带封面；仅脚本 musicSearch action）。脚本不支持则返回 null</summary>
     public async Task<List<OnlineSong>?> SearchAsync(string keyword, int page = 1, int pageSize = 20)
     {
-        // 脚本优先：若脚本支持所选源（或自动=任一脚本源）的 musicSearch，走脚本
-        if (ScriptReady)
-        {
-            var sources = _script!.Sources!;
-            var wantShort = LxPlatformCodes.ToShort(_config.DefaultSource);
-            var canScriptSearch = string.IsNullOrEmpty(_config.DefaultSource)
-                ? sources.SourceCodes.Any(c => sources.Supports(c, "musicSearch"))
-                : sources.Supports(wantShort, "musicSearch");
-            if (canScriptSearch)
-            {
-                var codes = string.IsNullOrEmpty(_config.DefaultSource)
-                    ? sources.SourceCodes.Where(c => sources.Supports(c, "musicSearch")).ToList()
-                    : new List<string> { wantShort };
-                var all = new List<OnlineSong>();
-                foreach (var code in codes)
-                {
-                    var r = await _script.SearchAsync(keyword, page, pageSize, code);
-                    if (r == null) continue;
-                    foreach (var it in r) all.Add(ToOnlineSongFromScript(it, code));
-                }
-                if (all.Count > 0)
-                {
-                    await ResolveCoversAsync(all);
-                    return all;
-                }
-                // 脚本无结果 → 继续回落 server
-            }
-        }
+        if (!ScriptReady) return null;
+        var sources = _script!.Sources!;
+        var wantShort = LxPlatformCodes.ToShort(_config.DefaultSource);
+        var canSearch = string.IsNullOrEmpty(_config.DefaultSource)
+            ? sources.SourceCodes.Any(c => sources.Supports(c, "musicSearch"))
+            : sources.Supports(wantShort, "musicSearch");
+        if (!canSearch) return null;
 
-        var songs = await _client.SearchAsync(keyword, page, pageSize, _config.DefaultSource);
-        if (songs == null) return null;
-        var list = new List<OnlineSong>(songs.Count);
-        foreach (var s in songs) list.Add(ToOnlineSong(s));
-        await ResolveCoversAsync(list);
-        return list;
+        var codes = string.IsNullOrEmpty(_config.DefaultSource)
+            ? sources.SourceCodes.Where(c => sources.Supports(c, "musicSearch")).ToList()
+            : new List<string> { wantShort };
+        var all = new List<OnlineSong>();
+        foreach (var code in codes)
+        {
+            var r = await _script.SearchAsync(keyword, page, pageSize, code);
+            if (r == null) continue;
+            foreach (var it in r) all.Add(ToOnlineSongFromScript(it, code));
+        }
+        if (all.Count == 0) return all;
+        await ResolveCoversAsync(all);
+        return all;
     }
 
-    /// <summary>获取播放直链（音质档位：0 默认/1 高品/2 无损；优先脚本 musicUrl，回落 server）</summary>
+    /// <summary>获取播放直链（仅脚本 musicUrl action；不支持则 null）</summary>
     public async Task<string?> GetPlayUrlAsync(OnlineSong song, int quality = 0)
     {
+        if (!ScriptReady) return null;
         var s = ToLxSong(song);
-        if (s == null) return null;
+        if (s == null || string.IsNullOrWhiteSpace(s.Source)) return null;
+        var code = LxPlatformCodes.ToShort(s.Source);
+        if (!_script!.Supports(code, "musicUrl")) return null;
         var q = quality > 0 ? quality : _config.QualityLevel;
-        // 脚本优先：歌曲来源的源短码若被脚本支持，走脚本
-        if (ScriptReady && !string.IsNullOrWhiteSpace(s.Source))
-        {
-            var code = LxPlatformCodes.ToShort(s.Source);
-            if (_script!.Supports(code, "musicUrl"))
-            {
-                var url = await _script.GetMusicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, LxQualityFor(q));
-                if (!string.IsNullOrWhiteSpace(url)) return url;
-                // 脚本解析失败（VIP/失效）→ 回落 server
-            }
-        }
-        return await _client.GetSongUrlAsync(s, BrForQuality(q));
+        return await _script.GetMusicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, LxQualityFor(q));
     }
 
-    /// <summary>获取歌词（原文 + 译文 + 罗马音三流，优先脚本 lyric，回落 server）</summary>
+    /// <summary>获取歌词（原文 + 译文 + 罗马音三流，仅脚本 lyric action）</summary>
     public async Task<(string? Lrc, string? TLrc, string? RLrc)?> GetLyricsWithRomaAsync(OnlineSong song)
     {
+        if (!ScriptReady) return null;
         var s = ToLxSong(song);
-        if (s == null) return null;
-        if (ScriptReady && !string.IsNullOrWhiteSpace(s.Source))
-        {
-            var code = LxPlatformCodes.ToShort(s.Source);
-            if (_script!.Supports(code, "lyric"))
-            {
-                var r = await _script.GetLyricAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds);
-                if (r != null && !string.IsNullOrWhiteSpace(r.Value.Lrc)) return r;
-            }
-        }
-        return await _client.GetLyricsAsync(s);
+        if (s == null || string.IsNullOrWhiteSpace(s.Source)) return null;
+        var code = LxPlatformCodes.ToShort(s.Source);
+        if (!_script!.Supports(code, "lyric")) return null;
+        return await _script.GetLyricAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds);
     }
 
     /// <summary>获取歌词（原文 + 译文；接口要求）</summary>
@@ -220,7 +185,6 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return r == null ? null : (r.Value.Lrc, r.Value.TLrc);
     }
 
-    /// <summary>lx 协议无歌单能力（lx-music-api-server 无歌单端点）</summary>
     public Task<List<OnlinePlaylist>> GetPlaylistsAsync(string? category = null)
         => Task.FromResult(new List<OnlinePlaylist>());
 
@@ -229,13 +193,9 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     // ── ILyricsProviderPlugin：宿主歌词兜底链（RemoteId "lx:source:id" 路由）──
 
-    /// <summary>歌词服务可用（已配置服务器）</summary>
-    public bool IsAvailable => _client.HasServer;
+    /// <summary>歌词服务可用（脚本已加载且支持 lyric）</summary>
+    public bool IsAvailable => ScriptReady;
 
-    /// <summary>
-    /// 宿主兜底链调用：仅处理 RemoteId 形如 "lx:source:id" 的歌曲，
-    /// 拉取三流歌词并按时间戳合并为结构化 <see cref="LrcLyrics"/>。
-    /// </summary>
     public async Task<LrcLyrics?> GetLyricsAsync(Song song)
     {
         if (song?.RemoteId == null || !song.RemoteId.StartsWith("lx:", StringComparison.OrdinalIgnoreCase))
@@ -257,26 +217,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     // ── 模型转换 ──
 
-    /// <summary>LxSong → OnlineSong（Id 用复合形式 "source:id"，歌词/直链路由需要）</summary>
-    private static OnlineSong ToOnlineSong(LxSong s) => new()
-    {
-        Id = string.IsNullOrWhiteSpace(s.Source) ? s.Id : $"{s.Source}:{s.Id}",
-        Platform = "lx",
-        PlatformName = "LX 源音乐",
-        Title = s.Name,
-        Artist = s.Artist,
-        Album = s.Album,
-        DurationMs = s.IntervalSeconds * 1000,
-        Internal = new Dictionary<string, object>
-        {
-            ["Source"] = s.Source,
-            ["RawId"] = s.Id,
-            ["PicId"] = s.PicId,
-            ["UrlId"] = s.UrlId,
-        },
-    };
-
-    /// <summary>脚本 musicSearch 结果 → OnlineSong（Id 用 "全名:rawId"，与 server 结果同形）</summary>
+    /// <summary>脚本 musicSearch 结果 → OnlineSong（Id 用 "全名:rawId"）</summary>
     private static OnlineSong ToOnlineSongFromScript(LxScriptSearchItem it, string sourceCode)
     {
         var full = LxPlatformCodes.ToFull(sourceCode);
@@ -298,9 +239,8 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     }
 
     /// <summary>
-    /// OnlineSong → LxSong。
-    /// Id 兼容两种形态：复合 "source:id"（本插件搜索结果）或裸 "id"（宿主从
-    /// RemoteId 构造时只有 "source:id" 复合形式；无 Internal 时按冒号拆分）。
+    /// OnlineSong → LxSong（提取 source + raw id 供脚本 musicUrl/lyric/pic 调用）。
+    /// Id 兼容复合 "source:id" 或裸 "id"（无 Internal 时按冒号拆分）。
     /// </summary>
     private static LxSong? ToLxSong(OnlineSong os)
     {
@@ -320,7 +260,6 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
                 id = os.Id[(idx + 1)..];
             }
         }
-        string Get(string key) => os.Internal != null && os.Internal.TryGetValue(key, out var v) && v is string str ? str : "";
         return new LxSong
         {
             Id = id,
@@ -328,56 +267,33 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
             Name = os.Title ?? "",
             Artist = os.Artist ?? "",
             Album = os.Album ?? "",
-            PicId = Get("PicId"),
-            UrlId = Get("UrlId"),
             IntervalSeconds = os.DurationMs > 0 ? os.DurationMs / 1000 : 0,
         };
     }
 
-    /// <summary>并发解析搜索结果封面（全局 ~4.5s 超时，失败保留占位图）</summary>
+    /// <summary>并发解析搜索结果封面（脚本 pic action，全局 ~4.5s 超时）</summary>
     private async Task ResolveCoversAsync(List<OnlineSong> list)
     {
         if (list.Count == 0) return;
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4.5));
         var tasks = list.Select(os => ResolveCoverAsync(os, cts.Token)).ToArray();
-        try { await Task.WhenAll(tasks); } catch { /* 个别失败忽略 */ }
+        try { await Task.WhenAll(tasks); } catch { }
     }
 
     private async Task ResolveCoverAsync(OnlineSong os, CancellationToken ct)
     {
+        if (!ScriptReady) return;
         var s = ToLxSong(os);
-        if (s == null) return;
-        // 脚本优先：若脚本支持该源 pic，走脚本
-        if (ScriptReady && !string.IsNullOrWhiteSpace(s.Source))
-        {
-            var code = LxPlatformCodes.ToShort(s.Source);
-            if (_script!.Supports(code, "pic"))
-            {
-                try
-                {
-                    await CoverGate.WaitAsync(ct);
-                    try
-                    {
-                        var url = await _script.GetPicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, ct);
-                        if (!string.IsNullOrWhiteSpace(url)) { os.CoverUrl = url; return; }
-                    }
-                    finally { CoverGate.Release(); }
-                }
-                catch { /* 脚本封面失败 → 回落 server */ }
-            }
-        }
+        if (s == null || string.IsNullOrWhiteSpace(s.Source)) return;
+        var code = LxPlatformCodes.ToShort(s.Source);
+        if (!_script!.Supports(code, "pic")) return;
         await CoverGate.WaitAsync(ct);
         try
         {
-            var url = await _client.GetPicUrlAsync(s, 300, ct);
+            var url = await _script.GetPicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, ct);
             if (!string.IsNullOrWhiteSpace(url)) os.CoverUrl = url;
         }
-        catch
-        {
-        }
-        finally
-        {
-            CoverGate.Release();
-        }
+        catch { }
+        finally { CoverGate.Release(); }
     }
 }

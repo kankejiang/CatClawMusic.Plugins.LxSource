@@ -131,7 +131,14 @@ public class LxBridge
     /// <summary>send(inited, data) 时捕获的源声明</summary>
     public LxScriptSources? Sources { get; private set; }
 
+    /// <summary>脚本是否已 inited</summary>
     public bool Inited { get; private set; }
+
+    /// <summary>send(updateAlert, data) 时捕获的更新提示（脚本检测到新版会发此事件且不发 inited）</summary>
+    public string? UpdateMessage { get; private set; }
+    public string? UpdateVersion { get; private set; }
+    public string? UpdateUrl { get; private set; }
+    public bool HasUpdateAlert => UpdateMessage != null;
 
     /// <summary>request 失败时的最后错误（调试用）</summary>
     public string? LastError { get; private set; }
@@ -150,6 +157,24 @@ public class LxBridge
         {
             Inited = true;
             Sources = ParseSources(data);
+        }
+        else if (name == "updateAlert")
+        {
+            // 脚本检测到新版：{version, message, updateUrl/downloadUrl}，发此事件后通常不发 inited
+            try
+            {
+                if (data.IsObject())
+                {
+                    var o = data.AsObject();
+                    string Get(string k) => o.Get(k) is var v && v.IsString() ? v.AsString() : "";
+                    UpdateMessage = Get("message") ?? Get("changeLog") ?? Get("desc");
+                    UpdateVersion = Get("version") ?? Get("newVersion");
+                    UpdateUrl = Get("updateUrl") ?? Get("downloadUrl") ?? Get("url");
+                    if (string.IsNullOrEmpty(UpdateMessage) && !string.IsNullOrEmpty(UpdateVersion))
+                        UpdateMessage = $"发现新版本 {UpdateVersion}";
+                }
+            }
+            catch { /* 解析失败忽略 */ }
         }
     }
 
@@ -233,6 +258,12 @@ public class LxBridge
                 if (v.IsString()) headers[k] = v.AsString();
         var b = o.Get("body");
         if (b.IsString()) body = b.AsString();
+        else if (b.IsObject() || b.IsArray())
+        {
+            // body 是 JS 对象（如 {source,id,level}）→ JSON 序列化（长青SVIP 等脚本用此形式）
+            body = JsonSerializer.Serialize(ToClr(b));
+            if (!headers.ContainsKey("content-type")) headers["content-type"] = "application/json";
+        }
         var json = o.Get("json");
         if (json.IsObject() || json.IsArray() || json.IsString() || json.IsNumber() || json.IsBoolean())
         {
@@ -265,16 +296,13 @@ public class LxBridge
         var req = new HttpRequestMessage(new HttpMethod(method), url);
         foreach (var (k, v) in headers)
         {
-            // Content-Type 由 HttpContent 自动管理，避免重复
-            if (k.Equals("content-type", StringComparison.OrdinalIgnoreCase) && body != null) continue;
+            // Content-Type 由 HttpContent 管理，避免重复
+            if (k.Equals("content-type", StringComparison.OrdinalIgnoreCase)) continue;
             req.Headers.TryAddWithoutValidation(k, v);
         }
         if (body != null)
         {
             var ct = headers.TryGetValue("content-type", out var ctv) ? ctv : "application/json";
-            req.Content = new StringContent(body, Encoding.UTF8, ct);
-            if (ct.IndexOf("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase) >= 0)
-                req.Content = new FormUrlEncodedContent(headers); // 简化：form 已在 body 里
             req.Content = new StringContent(body, Encoding.UTF8, ct);
         }
         return req;
@@ -474,14 +502,24 @@ public class LxScriptHost : IDisposable
 
     public bool IsLoaded => _engine != null && _bridge?.Inited == true;
     public string ScriptUrl { get; private set; } = "";
+    public string ScriptFilePath { get; private set; } = "";
+    /// <summary>导入方式：online=URL 拉取，local=本地文件</summary>
+    public string ImportMode { get; private set; } = "";
     public LxScriptSources? Sources => _bridge?.Sources;
     public string? LastError { get; private set; }
+    /// <summary>脚本更新提示（脚本检测到新版时填充）</summary>
+    public string? UpdateMessage => _bridge?.UpdateMessage;
+    public string? UpdateVersion => _bridge?.UpdateVersion;
+    public string? UpdateUrl => _bridge?.UpdateUrl;
+    public bool HasUpdateAlert => _bridge?.HasUpdateAlert == true;
 
-    /// <summary>下载并执行脚本；返回是否成功 inited。</summary>
+    /// <summary>在线导入：下载 .js 并执行。</summary>
     public async Task<bool> LoadAsync(string jsUrl, CancellationToken ct = default)
     {
         Unload();
         ScriptUrl = (jsUrl ?? "").Trim();
+        ScriptFilePath = "";
+        ImportMode = "online";
         if (string.IsNullOrEmpty(ScriptUrl))
         {
             LastError = "脚本地址为空";
@@ -490,7 +528,7 @@ public class LxScriptHost : IDisposable
         try
         {
             var code = await FetchHttp.GetStringAsync(ScriptUrl, ct).ConfigureAwait(false);
-            return Run(code);
+            return await RunAsync(code);
         }
         catch (Exception ex)
         {
@@ -499,8 +537,32 @@ public class LxScriptHost : IDisposable
         }
     }
 
-    /// <summary>直接执行脚本代码（测试用）。</summary>
-    public bool Run(string code)
+    /// <summary>本地导入：读取本地 .js 文件并执行。</summary>
+    public async Task<bool> LoadFromFileAsync(string filePath, CancellationToken ct = default)
+    {
+        Unload();
+        ScriptFilePath = (filePath ?? "").Trim();
+        ScriptUrl = "";
+        ImportMode = "local";
+        if (string.IsNullOrEmpty(ScriptFilePath) || !File.Exists(ScriptFilePath))
+        {
+            LastError = "脚本文件不存在";
+            return false;
+        }
+        try
+        {
+            var code = await File.ReadAllTextAsync(ScriptFilePath, ct).ConfigureAwait(false);
+            return await RunAsync(code);
+        }
+        catch (Exception ex)
+        {
+            LastError = "读取脚本文件失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>执行脚本代码（async：脚本用 async IIFE 初始化时需 drain 微任务）。</summary>
+    public async Task<bool> RunAsync(string code)
     {
         try
         {
@@ -509,9 +571,18 @@ public class LxScriptHost : IDisposable
                 .TimeoutInterval(TimeSpan.FromSeconds(8)));
             _bridge = new LxBridge(_engine);
             _engine.Global["lx"] = JsValue.FromObject(_engine, _bridge);
-            _engine.Execute(code);
+            // 提供 no-op console（脚本常用 console.log 调试，Jint 默认无 console）
+            _engine.Execute("var console={log:function(){},error:function(){},warn:function(){},info:function(){},debug:function(){},trace:function(){}}");
+            // ExecuteAsync 会 await 脚本里 pending 的 Promise/async IIFE（如 checkUpdate 后 send inited）
+            await _engine.ExecuteAsync(code);
             if (_bridge.Inited && _bridge.Sources != null && _bridge.Sources.SourceCodes.Count > 0)
                 return true;
+            // 脚本发了 updateAlert 但未 inited（检测到新版，拒绝运行旧版）
+            if (_bridge.HasUpdateAlert)
+            {
+                LastError = _bridge.UpdateMessage ?? "脚本有新版本";
+                return false;
+            }
             LastError = _bridge!.Inited ? "脚本未声明任何源" : "脚本未调用 send(inited, ...)";
             return false;
         }
@@ -522,10 +593,16 @@ public class LxScriptHost : IDisposable
         }
     }
 
+    /// <summary>同步执行（脚本顶层无 async 时用；兼容旧调用）。</summary>
+    public bool Run(string code) => RunAsync(code).GetAwaiter().GetResult();
+
     public void Unload()
     {
         _engine = null;
         _bridge = null;
+        ScriptUrl = "";
+        ScriptFilePath = "";
+        ImportMode = "";
     }
 
     /// <summary>脚本是否支持某源某 action。</summary>
