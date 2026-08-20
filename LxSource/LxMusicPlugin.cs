@@ -156,15 +156,16 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     }
 
     /// <summary>获取播放直链（仅脚本 musicUrl action；不支持则 null）。
+    /// quality 语义：>=0 直接用（0=128k 1=320k 2=FLAC）；负数使用配置档位。
     /// 音质按脚本声明降级 + 失败逐级重试（VIP 歌曲 flac 常取不到，自动降到 320k/128k）。</summary>
-    public async Task<string?> GetPlayUrlAsync(OnlineSong song, int quality = 0)
+    public async Task<string?> GetPlayUrlAsync(OnlineSong song, int quality = -1)
     {
         if (!ScriptReady) return null;
         var s = ToLxSong(song);
         if (s == null || string.IsNullOrWhiteSpace(s.Source)) return null;
         var code = LxPlatformCodes.ToShort(s.Source);
         if (!_script!.Supports(code, "musicUrl")) return null;
-        var q = quality > 0 ? quality : _config.QualityLevel;
+        var q = quality >= 0 ? quality : _config.QualityLevel;
 
         foreach (var level in ResolveQualityOrder(code, q))
         {

@@ -216,6 +216,112 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         }
     }
 
+    // ── 歌曲操作菜单（长按弹出：播放 / 下一首播放 / 下载）──
+
+    /// <summary>长按菜单是否打开</summary>
+    [ObservableProperty]
+    private bool _isSongMenuOpen;
+
+    /// <summary>长按选中的歌曲</summary>
+    [ObservableProperty]
+    private OnlineSong? _menuSong;
+
+    /// <summary>下载音质选择弹窗是否打开</summary>
+    [ObservableProperty]
+    private bool _isQualityPickerOpen;
+
+    /// <summary>待下载歌曲（音质选择确定后执行）</summary>
+    [ObservableProperty]
+    private OnlineSong? _downloadSong;
+
+    [RelayCommand]
+    private void OpenSongMenu(OnlineSong? song)
+    {
+        if (song == null) return;
+        MenuSong = song;
+        IsSongMenuOpen = true;
+    }
+
+    [RelayCommand]
+    private void CloseSongMenu() => IsSongMenuOpen = false;
+
+    /// <summary>菜单：播放（当前歌 → 整列表入队播放）</summary>
+    [RelayCommand]
+    private async Task PlayNowAsync()
+    {
+        var song = MenuSong;
+        CloseSongMenu();
+        if (song != null) await PlaySongAsync(song);
+    }
+
+    /// <summary>菜单：下一首播放（取直链 → PlayQueue.AddNext 插入当前位置之后）</summary>
+    [RelayCommand]
+    private async Task PlayNextAsync()
+    {
+        var song = MenuSong;
+        CloseSongMenu();
+        if (song == null) return;
+        if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本"); return; }
+        try
+        {
+            var url = await _plugin.GetPlayUrlAsync(song, _plugin.Config.QualityLevel);
+            if (string.IsNullOrWhiteSpace(url)) { ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）"); return; }
+            var queue = _services.GetRequiredService<PlayQueue>();
+            queue.AddNext(LxPlaybackHelper.ToQueueSong(song, url));
+            ShowTip($"「{song.Title}」已插入下一首");
+        }
+        catch (Exception ex)
+        {
+            ShowTip($"下一首播放失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>菜单：下载（先选音质）</summary>
+    [RelayCommand]
+    private void OpenDownloadPicker()
+    {
+        DownloadSong = MenuSong;
+        CloseSongMenu();
+        if (DownloadSong != null) IsQualityPickerOpen = true;
+    }
+
+    [RelayCommand]
+    private void CancelQualityPicker() => IsQualityPickerOpen = false;
+
+    /// <summary>下载确认：按所选音质取直链 → 宿主下载管理器入队（下载中心可见）</summary>
+    [RelayCommand]
+    private async Task ConfirmDownloadAsync(string? qualityLabel)
+    {
+        var song = DownloadSong;
+        IsQualityPickerOpen = false;
+        DownloadSong = null;
+        if (song == null) return;
+        if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本"); return; }
+        try
+        {
+            var q = qualityLabel switch { "128k" => 0, "320k" => 1, _ => 2 };
+            var url = await _plugin.GetPlayUrlAsync(song, q);
+            if (string.IsNullOrWhiteSpace(url)) { ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）"); return; }
+            var ext = q == 2 ? "flac" : "mp3";
+            var fileName = $"{SanitizeFileName(song.Title)} - {SanitizeFileName(song.Artist)}.{ext}";
+            var dm = _services.GetService<CatClawMusic.Core.Interfaces.IDownloadManager>();
+            if (dm == null) { ShowTip("宿主下载管理器不可用"); return; }
+            var id = dm.EnqueueUrl(url, fileName);
+            ShowTip($"已开始下载「{fileName}」，可在宿主下载中心查看");
+        }
+        catch (Exception ex)
+        {
+            ShowTip($"下载失败：{ex.Message}");
+        }
+    }
+
+    private static string SanitizeFileName(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "未知";
+        foreach (var c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+        return s.Length > 60 ? s[..60] : s;
+    }
+
     // ── 设置 sheet ──
 
     [RelayCommand]

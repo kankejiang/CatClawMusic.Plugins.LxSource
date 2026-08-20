@@ -33,8 +33,9 @@ public class LxOnlineMusicPage : ContentPage
 
         var mainContent = BuildMainContent();
         var sheetContainer = BuildSettingsSheet();
+        var songMenuContainer = BuildSongMenuOverlay();
 
-        Content = new Grid { Children = { mainContent, sheetContainer } };
+        Content = new Grid { Children = { mainContent, sheetContainer, songMenuContainer } };
     }
 
     protected override void OnAppearing()
@@ -129,7 +130,9 @@ public class LxOnlineMusicPage : ContentPage
         };
         ((Label)_songsView.EmptyView).SetDynamicResource(Label.TextColorProperty, "TextHintColor");
         _songsView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.Songs));
-        _songsView.ItemTemplate = new DataTemplate(LxUiKit.CreateSongItemTemplate);
+        // 长按 → 歌曲操作菜单（命令源为 VM，参数为歌曲项）
+        _songsView.ItemTemplate = new DataTemplate(() =>
+            LxUiKit.CreateSongItemTemplate(_vm.OpenSongMenuCommand));
         _songsView.SelectionChanged += OnSongSelected;
 
         // ── loading / tip ──
@@ -402,6 +405,180 @@ public class LxOnlineMusicPage : ContentPage
         return container;
     }
 
+    // ── 歌曲操作覆盖层：长按菜单 sheet + 下载音质选择弹窗 ──
+
+    private Grid BuildSongMenuOverlay()
+    {
+        const double menuHiddenY = 320;
+
+        // 菜单 sheet
+        var menuSheet = new Border
+        {
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = new CornerRadius(20, 20, 0, 0) },
+            Padding = new Thickness(0),
+            VerticalOptions = LayoutOptions.End,
+            HeightRequest = menuHiddenY,
+            TranslationY = menuHiddenY,
+        };
+        menuSheet.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+
+        // 菜单歌曲标题
+        var songLabel = new Label
+        {
+            FontSize = 13,
+            FontFamily = "OpenSansSemibold",
+            MaxLines = 1,
+            Padding = new Thickness(24, 2, 24, 2),
+        };
+        songLabel.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+        songLabel.SetBinding(Label.TextProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.MenuSong))
+            { Converter = SongTitleConverter.Instance });
+
+        // 菜单项
+        var menuItems = new VerticalStackLayout { Spacing = 4, Padding = new Thickness(16, 8, 16, 16) };
+        menuItems.Children.Add(CreateMenuRow("▶ 播放", nameof(LxOnlineMusicViewModel.PlayNowCommand)));
+        menuItems.Children.Add(CreateMenuRow("⏭ 下一首播放", nameof(LxOnlineMusicViewModel.PlayNextCommand)));
+        menuItems.Children.Add(CreateMenuRow("⬇ 下载", nameof(LxOnlineMusicViewModel.OpenDownloadPickerCommand)));
+
+        menuSheet.Content = new VerticalStackLayout
+        {
+            Spacing = 0,
+            Children =
+            {
+                new BoxView
+                {
+                    HeightRequest = 4,
+                    WidthRequest = 36,
+                    HorizontalOptions = LayoutOptions.Center,
+                    Margin = new Thickness(0, 8, 0, 8),
+                    Color = Color.FromArgb("#8A808080"),
+                },
+                songLabel,
+                menuItems,
+            },
+        };
+
+        // 下载音质选择弹窗（居中卡片）
+        var pickerCard = new Border
+        {
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 18 },
+            Padding = new Thickness(18, 14),
+            Margin = new Thickness(36, 0, 36, 0),
+            VerticalOptions = LayoutOptions.Center,
+            HorizontalOptions = LayoutOptions.Fill,
+            IsVisible = false,
+        };
+        pickerCard.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+        pickerCard.SetBinding(VisualElement.IsVisibleProperty, nameof(LxOnlineMusicViewModel.IsQualityPickerOpen));
+
+        var pickerTitle = new Label
+        {
+            Text = "选择下载音质",
+            FontSize = 15,
+            FontFamily = "OpenSansSemibold",
+            HorizontalOptions = LayoutOptions.Center,
+            Margin = new Thickness(0, 2, 0, 10),
+        };
+        pickerTitle.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+
+        var qualityRow = new HorizontalStackLayout
+        {
+            Spacing = 8,
+            HorizontalOptions = LayoutOptions.Center,
+            Children =
+            {
+                CreatePickerButton("128k"),
+                CreatePickerButton("320k"),
+                CreatePickerButton("无损"),
+            },
+        };
+
+        var pickerCancel = CreateActionButton("取消", _vm.CancelQualityPickerCommand);
+        pickerCancel.HorizontalOptions = LayoutOptions.Center;
+        pickerCancel.Margin = new Thickness(0, 12, 0, 0);
+
+        pickerCard.Content = new VerticalStackLayout
+        {
+            Spacing = 0,
+            Children = { pickerTitle, qualityRow, pickerCancel },
+        };
+
+        // 遮罩（共用：任一弹层打开时显示并拦截）
+        var overlay = new BoxView
+        {
+            Color = Color.FromArgb("#80000000"),
+            IsVisible = false,
+        };
+        var overlayTap = new TapGestureRecognizer();
+        overlayTap.Tapped += async (_, _) =>
+        {
+            _vm.CloseSongMenuCommand.Execute(null);
+            _vm.CancelQualityPickerCommand.Execute(null);
+        };
+        overlay.GestureRecognizers.Add(overlayTap);
+
+        var container = new Grid
+        {
+            InputTransparent = true,
+            Children = { overlay, menuSheet, pickerCard },
+        };
+
+        // 输入穿透 + 遮罩显隐 + 动画：由 VM 状态驱动
+        void SyncOverlay()
+        {
+            var open = _vm.IsSongMenuOpen || _vm.IsQualityPickerOpen;
+            overlay.IsVisible = open;
+            menuSheet.InputTransparent = !_vm.IsSongMenuOpen;
+            pickerCard.InputTransparent = !_vm.IsQualityPickerOpen;
+            _ = menuSheet.TranslateTo(0, _vm.IsSongMenuOpen ? 0 : menuHiddenY, 200u, Easing.CubicOut);
+            container.InputTransparent = !open;  // 关闭时穿透，不拦截主页面
+        }
+        _vm.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName is nameof(LxOnlineMusicViewModel.IsSongMenuOpen)
+                or nameof(LxOnlineMusicViewModel.IsQualityPickerOpen))
+            {
+                SyncOverlay();
+            }
+        };
+        return container;
+    }
+
+    /// <summary>长按菜单行：图标+文字，点击执行指定命令</summary>
+    private Border CreateMenuRow(string text, string commandPropertyName)
+    {
+        var row = new Border
+        {
+            Padding = new Thickness(16, 13),
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 12 },
+        };
+        row.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+        var label = new Label { Text = text, FontSize = 14 };
+        label.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+        row.Content = label;
+        var tap = new TapGestureRecognizer();
+        tap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(commandPropertyName));
+        row.GestureRecognizers.Add(tap);
+        return row;
+    }
+
+    /// <summary>音质选择按钮（128k/320k/无损 → ConfirmDownloadCommand 参数）</summary>
+    private Border CreatePickerButton(string label)
+    {
+        var btn = CreateActionButton(label, _vm.ConfirmDownloadCommand);
+        // ConfirmDownloadCommand 参数 = 音质档标签
+        var tap = new TapGestureRecognizer();
+        tap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(nameof(LxOnlineMusicViewModel.ConfirmDownloadCommand)));
+        tap.SetBinding(TapGestureRecognizer.CommandParameterProperty, new Binding("Source") { Source = label });
+        btn.GestureRecognizers.Clear();
+        btn.GestureRecognizers.Add(tap);
+        return btn;
+    }
+
     // ── 事件 ──
 
     /// <summary>点歌播放（整列表入队）</summary>
@@ -544,6 +721,16 @@ public class LxOnlineMusicPage : ContentPage
         };
         return tap;
     }
+}
+
+/// <summary>OnlineSong → "标题 - 歌手"（长按菜单歌曲标题显示）。</summary>
+internal sealed class SongTitleConverter : IValueConverter
+{
+    public static readonly SongTitleConverter Instance = new();
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => value is OnlineSong s ? $"{s.Title} - {s.Artist}" : "";
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
 }
 
 /// <summary>bool → !bool（InputTransparent 反转：sheet 打开=false 可交互，关闭=true 穿透）。</summary>

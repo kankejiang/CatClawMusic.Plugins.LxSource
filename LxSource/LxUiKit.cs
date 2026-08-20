@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Windows.Input;
 using CatClawMusic.Core.Models;
 using Microsoft.Maui.Controls;
 using Microsoft.Maui.Controls.Shapes;
@@ -21,8 +22,9 @@ public static class LxUiKit
         return Color.FromArgb("#7B68EE");
     }
 
-    /// <summary>歌曲行：封面 40 + 标题/艺术家 + 时长右对齐（点击由 CollectionView SelectionChanged 处理）</summary>
-    public static View CreateSongItemTemplate()
+    /// <summary>歌曲行：封面 40 + 标题/艺术家 + 时长右对齐（点击由 CollectionView SelectionChanged 处理）。
+    /// longPressCommand 非空时附加长按手势（PointerGestureRecognizer + 500ms 计时；命令参数为歌曲项本身）。</summary>
+    public static View CreateSongItemTemplate(ICommand? longPressCommand = null)
     {
         var coverBorder = new Border
         {
@@ -48,7 +50,7 @@ public static class LxUiKit
         durationLabel.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
         durationLabel.SetBinding(Label.TextProperty, new Binding(nameof(OnlineSong.DurationMs), converter: DurationConverter.Instance));
 
-        return new Grid
+        var root = new Grid
         {
             Padding = new Thickness(14, 8),
             ColumnDefinitions = new ColumnDefinitionCollection
@@ -70,6 +72,31 @@ public static class LxUiKit
                 durationLabel.GridColumn(2),
             },
         };
+
+        // 长按 → 歌曲操作菜单（PointerGestureRecognizer + 500ms 计时；MAUI 无内置 LongPress）
+        if (longPressCommand != null)
+        {
+            var pointer = new PointerGestureRecognizer();
+            var cts = new CancellationTokenSource();
+            pointer.PointerPressed += (_, _) =>
+            {
+                cts.Cancel();
+                cts = new CancellationTokenSource();
+                var ct = cts.Token;
+                _ = Task.Delay(500, ct).ContinueWith(_ =>
+                {
+                    if (ct.IsCancellationRequested) return;
+                    MainThread.BeginInvokeOnMainThread(() =>
+                    {
+                        if (longPressCommand.CanExecute(root.BindingContext))
+                            longPressCommand.Execute(root.BindingContext);
+                    });
+                }, ct);
+            };
+            pointer.PointerReleased += (_, _) => cts.Cancel();
+            root.GestureRecognizers.Add(pointer);
+        }
+        return root;
     }
 
     /// <summary>音源 chip 模板（Tap 命令绑定到指定源，参数为 chip 项本身）</summary>
