@@ -1,0 +1,684 @@
+using System.Collections.Concurrent;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Jint;
+using Jint.Native;
+using Jint.Native.Object;
+
+namespace CatClawMusic.Plugins.LxSource;
+
+// ──────────────────────────────────────────────────────────────────────────
+//  Jint 引擎加载器：从嵌入资源加载 Jint.dll / Acornima.dll
+// ──────────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// 把嵌入资源的 Jint.dll / Acornima.dll 在首次需要时通过 AppDomain.AssemblyResolve
+/// 加载进 AppDomain。插件 .ccp 是单 DLL、宿主不提供 Jint，故必须自加载。
+/// <para>契约：插件类型不得继承/字段签名引用 Jint 类型——只能在方法体内引用，
+/// 否则宿主 GetTypes() 阶段 JIT 解析类型时会早于本加载器注册而失败。</para>
+/// </summary>
+public static class LxScriptEngineLoader
+{
+    private static readonly Dictionary<string, string> ResByName = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Jint"] = "Jint.dll",
+        ["Acornima"] = "Acornima.dll",
+    };
+
+    private static int _registered;
+
+    /// <summary>注册 AssemblyResolve 处理器（幂等）。由 ModuleInitializer 调用。</summary>
+    [ModuleInitializer]
+    internal static void Register()
+    {
+        if (Interlocked.CompareExchange(ref _registered, 1, 0) != 0) return;
+        AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
+    }
+
+    private static Assembly? OnAssemblyResolve(object? sender, ResolveEventArgs args)
+    {
+        var name = new AssemblyName(args.Name).Name ?? "";
+        if (!ResByName.TryGetValue(name, out var resName)) return null;
+        var asm = typeof(LxScriptEngineLoader).Assembly;
+        using var stream = asm.GetManifestResourceStream(resName);
+        if (stream == null) return null;
+        using var ms = new MemoryStream((int)stream.Length);
+        stream.CopyTo(ms);
+        return Assembly.Load(ms.ToArray());
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  平台码映射：lx 短码（wy/kw/kg/tx/mg）↔ lx-music-api-server 全名（netease/...）
+// ──────────────────────────────────────────────────────────────────────────
+
+/// <summary>lx 自定义源短码与 lx-music-api-server 全名互转（kw=酷我/wy=网易 等）。</summary>
+public static class LxPlatformCodes
+{
+    /// <summary>全名 → lx 短码（netease→wy, qq→tx, kuwo→kw, kugou→kg, migu→mg）</summary>
+    public static readonly Dictionary<string, string> FullToShort = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["netease"] = "wy",
+        ["qq"] = "tx",
+        ["kuwo"] = "kw",
+        ["kugou"] = "kg",
+        ["migu"] = "mg",
+    };
+
+    /// <summary>lx 短码 → 全名</summary>
+    public static readonly Dictionary<string, string> ShortToFull = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["wy"] = "netease",
+        ["tx"] = "qq",
+        ["kw"] = "kuwo",
+        ["kg"] = "kugou",
+        ["mg"] = "migu",
+    };
+
+    public static string ToShort(string full) =>
+        FullToShort.TryGetValue(full ?? "", out var s) ? s : (full ?? "");
+
+    public static string ToFull(string short_) =>
+        ShortToFull.TryGetValue(short_ ?? "", out var f) ? f : (short_ ?? "");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  脚本声明的源信息（inited 返回的 sources）
+// ──────────────────────────────────────────────────────────────────────────
+
+/// <summary>脚本通过 send(inited, {sources:{ wy:{ actions:['musicUrl'], qualitys:[...] }, ... }}) 声明的源能力。</summary>
+public class LxScriptSources
+{
+    /// <summary>key=源短码（wy/kw...），value=该源支持的 action 列表</summary>
+    public Dictionary<string, HashSet<string>> ActionsBySource { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>源短码集合</summary>
+    public List<string> SourceCodes => ActionsBySource.Keys.ToList();
+
+    public bool Supports(string sourceCode, string action) =>
+        ActionsBySource.TryGetValue(sourceCode ?? "", out var set) && set.Contains(action);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  JS 桥（globalThis.lx）：EVENT_NAMES / env / version / on / send / request / utils
+// ──────────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// lx-music 自定义源 SDK 的 CLR 桥。Jint 的 ObjectWrapper 自动把属性/方法暴露给 JS，
+/// 脚本 `const { EVENT_NAMES, request, on, send, utils, env, version } = globalThis.lx` 解构即用。
+/// </summary>
+public class LxBridge
+{
+    private readonly Engine _engine;
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
+
+    public readonly Dictionary<string, string> EVENT_NAMES = new(StringComparer.Ordinal)
+    {
+        ["request"] = "request",
+        ["inited"] = "inited",
+        ["updateAlert"] = "updateAlert",
+    };
+
+    public string env => "desktop";
+    public string version => "2.0.0";
+
+    /// <summary>on(name, handler) 注册的处理器（key=event name, value=JS handler）</summary>
+    public Dictionary<string, JsValue> Handlers { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>send(inited, data) 时捕获的源声明</summary>
+    public LxScriptSources? Sources { get; private set; }
+
+    public bool Inited { get; private set; }
+
+    /// <summary>request 失败时的最后错误（调试用）</summary>
+    public string? LastError { get; private set; }
+
+    public LxBridge(Engine engine) { _engine = engine; }
+
+    public void on(string name, JsValue handler)
+    {
+        if (!string.IsNullOrEmpty(name) && handler.IsObject())
+            Handlers[name] = handler;
+    }
+
+    public void send(string name, JsValue data)
+    {
+        if (name == "inited")
+        {
+            Inited = true;
+            Sources = ParseSources(data);
+        }
+    }
+
+    private static LxScriptSources ParseSources(JsValue data)
+    {
+        var src = new LxScriptSources();
+        try
+        {
+            if (!data.IsObject()) return src;
+            var sourcesObj = data.AsObject().Get("sources");
+            if (!sourcesObj.IsObject()) return src;
+            var srcObj = sourcesObj.AsObject();
+            foreach (var (code, sv) in EnumerateObject(srcObj))
+            {
+                var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (sv.IsObject())
+                {
+                    var actions = sv.AsObject().Get("actions");
+                    if (actions.IsArray())
+                    {
+                        var arr = actions.AsArray();
+                        for (int i = 0; i < arr.Length; i++)
+                        {
+                            var a = arr.Get((uint)i);
+                            if (a.IsString()) set.Add(a.AsString());
+                        }
+                    }
+                }
+                src.ActionsBySource[code] = set;
+            }
+        }
+        catch { /* 容错：解析失败按空源处理，调用方会回落 server */ }
+        return src;
+    }
+
+    // request(url, options, callback) —— lx 协议 Node 风格回调
+    public void request(string url, JsValue options, JsValue callback)
+    {
+        try
+        {
+            var (method, headers, body, timeoutMs, followRedirect) = ParseOptions(options);
+            var cts = timeoutMs > 0
+                ? new CancellationTokenSource(timeoutMs)
+                : new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var req = BuildRequest(url, method, headers, body);
+            // 同步执行：脚本用回调式 Promise，request 内完成 HTTP 后立即回调 resolve，
+            // Promise 在 request 返回时已 settle，UnwrapIfPromiseAsync 直接读值。
+            using var resp = Http.SendAsync(req, cts.Token).GetAwaiter().GetResult();
+            var raw = ReadBody(resp);
+            var respObj = new Dictionary<string, object?>
+            {
+                ["statusCode"] = (int)resp.StatusCode,
+                ["headers"] = ReadHeaders(resp),
+                ["raw"] = raw,
+                ["body"] = ParseBody(raw, resp.Content.Headers.ContentType?.MediaType),
+            };
+            callback.Call(JsValue.Undefined, new JsValue[] { JsValue.Null, JsValue.FromObject(_engine, respObj) });
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            var errObj = new Dictionary<string, object?> { ["message"] = ex.Message, ["name"] = ex.GetType().Name };
+            callback.Call(JsValue.Undefined, new JsValue[] { JsValue.FromObject(_engine, errObj), JsValue.Null });
+        }
+    }
+
+    private static (string method, Dictionary<string, string> headers, string? body, int timeoutMs, bool followRedirect) ParseOptions(JsValue options)
+    {
+        var method = "GET";
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string? body = null;
+        int timeoutMs = 0;
+        var follow = true;
+        if (!options.IsObject()) return (method, headers, body, timeoutMs, follow);
+        var o = options.AsObject();
+        var m = o.Get("method");
+        if (m.IsString()) method = m.AsString().ToUpperInvariant();
+        var h = o.Get("headers");
+        if (h.IsObject())
+            foreach (var (k, v) in EnumerateObject(h.AsObject()))
+                if (v.IsString()) headers[k] = v.AsString();
+        var b = o.Get("body");
+        if (b.IsString()) body = b.AsString();
+        var json = o.Get("json");
+        if (json.IsObject() || json.IsArray() || json.IsString() || json.IsNumber() || json.IsBoolean())
+        {
+            // json 字段：把 JSON 序列化为 body 并设 content-type
+            body = json.IsString() ? json.AsString() : JsonSerializer.Serialize(ToClr(json));
+            if (!headers.ContainsKey("content-type")) headers["content-type"] = "application/json";
+        }
+        var form = o.Get("form");
+        if (form.IsObject())
+        {
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (var (k, v) in EnumerateObject(form.AsObject()))
+            {
+                if (!first) sb.Append('&'); first = false;
+                sb.Append(Uri.EscapeDataString(k)).Append('=').Append(Uri.EscapeDataString(v.IsString() ? v.AsString() : v.ToString()));
+            }
+            body = sb.ToString();
+            if (!headers.ContainsKey("content-type")) headers["content-type"] = "application/x-www-form-urlencoded";
+        }
+        var t = o.Get("timeout");
+        if (t.IsNumber()) timeoutMs = (int)t.AsNumber();
+        var fr = o.Get("followRedirect");
+        if (fr.IsBoolean()) follow = fr.AsBoolean();
+        return (method, headers, body, timeoutMs, follow);
+    }
+
+    private static HttpRequestMessage BuildRequest(string url, string method, Dictionary<string, string> headers, string? body)
+    {
+        var req = new HttpRequestMessage(new HttpMethod(method), url);
+        foreach (var (k, v) in headers)
+        {
+            // Content-Type 由 HttpContent 自动管理，避免重复
+            if (k.Equals("content-type", StringComparison.OrdinalIgnoreCase) && body != null) continue;
+            req.Headers.TryAddWithoutValidation(k, v);
+        }
+        if (body != null)
+        {
+            var ct = headers.TryGetValue("content-type", out var ctv) ? ctv : "application/json";
+            req.Content = new StringContent(body, Encoding.UTF8, ct);
+            if (ct.IndexOf("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase) >= 0)
+                req.Content = new FormUrlEncodedContent(headers); // 简化：form 已在 body 里
+            req.Content = new StringContent(body, Encoding.UTF8, ct);
+        }
+        return req;
+    }
+
+    private static string ReadBody(HttpResponseMessage resp)
+    {
+        // GetAwaiter().GetResult() 同步读
+        return resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+    }
+
+    private static Dictionary<string, string> ReadHeaders(HttpResponseMessage resp)
+    {
+        var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in resp.Headers.Concat(resp.Content.Headers))
+            dict[k] = string.Join(",", v);
+        return dict;
+    }
+
+    private static object? ParseBody(string raw, string? mediaType)
+    {
+        if (string.IsNullOrEmpty(raw)) return raw;
+        var isJson = (mediaType ?? "").IndexOf("json", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (!isJson)
+        {
+            // 即便 content-type 不是 json，也尝试解析（很多 lx fork 返回 text/plain 但实为 JSON）
+            var trimmed = raw.TrimStart();
+            if (trimmed.Length > 0 && (trimmed[0] == '{' || trimmed[0] == '[')) isJson = true;
+        }
+        if (!isJson) return raw;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            return ToClr(doc.RootElement);
+        }
+        catch
+        {
+            return raw;
+        }
+    }
+
+    private static object? ToClr(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Object => el.EnumerateObject().ToDictionary(p => p.Name, p => ToClr(p.Value))!,
+        JsonValueKind.Array => el.EnumerateArray().Select(ToClr).ToList()!,
+        JsonValueKind.String => el.GetString()!,
+        JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        _ => el.ToString(),
+    };
+
+    private static object? ToClr(JsValue v) => v switch
+    {
+        _ when v.IsString() => v.AsString(),
+        _ when v.IsNumber() => v.AsNumber(),
+        _ when v.IsBoolean() => v.AsBoolean(),
+        _ when v.IsNull() || v.IsUndefined() => null,
+        _ when v.IsObject() => EnumerateObject(v.AsObject())
+            .ToDictionary(kv => kv.Key, kv => ToClr(kv.Value))!,
+        _ => v.ToString(),
+    };
+
+    private static IEnumerable<KeyValuePair<string, JsValue>> EnumerateObject(ObjectInstance obj)
+    {
+        foreach (var p in obj.GetOwnProperties())
+        {
+            var key = p.Key.ToString();
+            if (!string.IsNullOrEmpty(key))
+                yield return new KeyValuePair<string, JsValue>(key, p.Value.Value);
+        }
+    }
+
+    // ── utils（基础实现；阶段 2 补 AES/RSA）──
+
+    public LxUtils utils => new(_engine);
+}
+
+/// <summary>lx utils 桥（buffer + crypto 基础；AES/RSA 见阶段 2）。</summary>
+public class LxUtils
+{
+    private readonly Engine _engine;
+    public LxUtils(Engine e) { _engine = e; }
+    public LxBufferUtils buffer => new(_engine);
+    public LxCryptoUtils crypto => new(_engine);
+}
+
+public class LxBufferUtils
+{
+    private readonly Engine _engine;
+    public LxBufferUtils(Engine e) { _engine = e; }
+
+    /// <summary>from(str/buf, encoding?) → byte[]（Jint 包装为可索引对象）</summary>
+    public object from(JsValue input, JsValue encoding)
+    {
+        if (input.IsString())
+            return Encoding.UTF8.GetBytes(input.AsString());
+        if (input.IsArray())
+        {
+            var arr = input.AsArray();
+            var bytes = new byte[arr.Length];
+            for (uint i = 0; i < arr.Length; i++) bytes[i] = (byte)arr.Get(i).AsNumber();
+            return bytes;
+        }
+        return Array.Empty<byte>();
+    }
+
+    /// <summary>bufToString(buf, encoding?) → string</summary>
+    public string bufToString(JsValue buf, JsValue encoding)
+    {
+        var bytes = ToBytes(buf);
+        return Encoding.UTF8.GetString(bytes);
+    }
+
+    public object alloc(int size) => new byte[Math.Max(0, size)];
+
+    internal static byte[] ToBytes(JsValue buf)
+    {
+        if (buf.IsString()) return Encoding.UTF8.GetBytes(buf.AsString());
+        if (buf.IsArray())
+        {
+            var arr = buf.AsArray();
+            var bytes = new byte[arr.Length];
+            for (uint i = 0; i < arr.Length; i++) bytes[i] = (byte)arr.Get(i).AsNumber();
+            return bytes;
+        }
+        // CLR byte[] 经 ObjectWrapper 包装时，尝试转回 byte[]
+        if (buf.ToObject() is byte[] b) return b;
+        return Array.Empty<byte>();
+    }
+}
+
+public class LxCryptoUtils
+{
+    private readonly Engine _engine;
+    public LxCryptoUtils(Engine e) { _engine = e; }
+
+    public string md5(JsValue input)
+    {
+        var bytes = LxBufferUtils.ToBytes(input);
+        return Convert.ToHexString(MD5.HashData(bytes)).ToLowerInvariant();
+    }
+
+    public string sha256(JsValue input)
+    {
+        var bytes = LxBufferUtils.ToBytes(input);
+        return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+    }
+
+    public string hmacSha256(JsValue data, JsValue key)
+    {
+        using var h = new HMACSHA256(LxBufferUtils.ToBytes(key));
+        return Convert.ToHexString(h.ComputeHash(LxBufferUtils.ToBytes(data))).ToLowerInvariant();
+    }
+
+    public object randomBytes(int size)
+    {
+        var bytes = RandomNumberGenerator.GetBytes(Math.Max(0, size));
+        return bytes;
+    }
+
+    public string base64Encode(JsValue input)
+    {
+        return Convert.ToBase64String(LxBufferUtils.ToBytes(input));
+    }
+
+    public object base64Decode(string input)
+    {
+        try { return Convert.FromBase64String(input); }
+        catch { return Array.Empty<byte>(); }
+    }
+
+    // AES / RSA —— 阶段 2 实现；这里抛明确异常，让调用方知道脚本用了未支持能力
+    public object aesEncrypt(JsValue data, JsValue mode, JsValue key, JsValue iv)
+        => throw new NotSupportedException("utils.crypto.aesEncrypt 未实现（计划阶段 2）");
+    public object aesDecrypt(JsValue data, JsValue mode, JsValue key, JsValue iv)
+        => throw new NotSupportedException("utils.crypto.aesDecrypt 未实现（计划阶段 2）");
+    public object rsaEncrypt(JsValue data, JsValue key)
+        => throw new NotSupportedException("utils.crypto.rsaEncrypt 未实现（计划阶段 2）");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+//  脚本宿主：加载 .js、暴露 lx SDK、分发 action
+// ──────────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// lx-music 自定义源 .js 脚本宿主：下载脚本 → 在 Jint 沙箱执行 → 捕获 inited 声明 →
+/// 按 action（musicUrl/lyric/pic/musicSearch）调用脚本注册的 request 处理器。
+/// </summary>
+public class LxScriptHost : IDisposable
+{
+    private static readonly HttpClient FetchHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
+
+    private Engine? _engine;
+    private LxBridge? _bridge;
+
+    public bool IsLoaded => _engine != null && _bridge?.Inited == true;
+    public string ScriptUrl { get; private set; } = "";
+    public LxScriptSources? Sources => _bridge?.Sources;
+    public string? LastError { get; private set; }
+
+    /// <summary>下载并执行脚本；返回是否成功 inited。</summary>
+    public async Task<bool> LoadAsync(string jsUrl, CancellationToken ct = default)
+    {
+        Unload();
+        ScriptUrl = (jsUrl ?? "").Trim();
+        if (string.IsNullOrEmpty(ScriptUrl))
+        {
+            LastError = "脚本地址为空";
+            return false;
+        }
+        try
+        {
+            var code = await FetchHttp.GetStringAsync(ScriptUrl, ct).ConfigureAwait(false);
+            return Run(code);
+        }
+        catch (Exception ex)
+        {
+            LastError = "下载脚本失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>直接执行脚本代码（测试用）。</summary>
+    public bool Run(string code)
+    {
+        try
+        {
+            _engine = new Engine(opts => opts
+                .LimitRecursion(5000)
+                .TimeoutInterval(TimeSpan.FromSeconds(8)));
+            _bridge = new LxBridge(_engine);
+            _engine.Global["lx"] = JsValue.FromObject(_engine, _bridge);
+            _engine.Execute(code);
+            if (_bridge.Inited && _bridge.Sources != null && _bridge.Sources.SourceCodes.Count > 0)
+                return true;
+            LastError = _bridge!.Inited ? "脚本未声明任何源" : "脚本未调用 send(inited, ...)";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LastError = "执行脚本失败：" + ex.Message;
+            return false;
+        }
+    }
+
+    public void Unload()
+    {
+        _engine = null;
+        _bridge = null;
+    }
+
+    /// <summary>脚本是否支持某源某 action。</summary>
+    public bool Supports(string sourceCode, string action) =>
+        IsLoaded && _bridge!.Sources != null && _bridge.Sources.Supports(sourceCode, action);
+
+    /// <summary>取播放直链（musicUrl action）。musicInfo 用过供式 id 字段覆盖常见脚本。</summary>
+    public async Task<string?> GetMusicUrlAsync(string sourceCode, string rawId, string title, string artist,
+        long durationSec, string lxQuality, CancellationToken ct = default)
+    {
+        if (!Supports(sourceCode, "musicUrl")) return null;
+        var musicInfo = new Dictionary<string, object?>
+        {
+            ["hash"] = rawId,
+            ["songmid"] = rawId,
+            ["songId"] = rawId,
+            ["id"] = rawId,
+            ["copyrightId"] = rawId,
+            ["name"] = title,
+            ["singer"] = artist,
+            ["interval"] = durationSec,
+        };
+        var arg = new Dictionary<string, object?>
+        {
+            ["action"] = "musicUrl",
+            ["source"] = sourceCode,
+            ["info"] = new Dictionary<string, object?> { ["musicInfo"] = musicInfo, ["type"] = lxQuality },
+        };
+        var result = await InvokeHandlerAsync(arg, ct).ConfigureAwait(false);
+        return result?.IsString() == true ? result.AsString() : null;
+    }
+
+    /// <summary>搜索（musicSearch action）。脚本返回歌曲数组，每项含 {id/name/singer/album/interval/source}。</summary>
+    public async Task<List<LxScriptSearchItem>?> SearchAsync(string keyword, int page, int limit, string sourceCode, CancellationToken ct = default)
+    {
+        if (!Supports(sourceCode, "musicSearch")) return null;
+        var arg = new Dictionary<string, object?>
+        {
+            ["action"] = "musicSearch",
+            ["source"] = sourceCode,
+            ["info"] = new Dictionary<string, object?> { ["text"] = keyword, ["page"] = page, ["limit"] = limit },
+        };
+        var result = await InvokeHandlerAsync(arg, ct).ConfigureAwait(false);
+        return ParseSearchResult(result);
+    }
+
+    /// <summary>歌词（lyric action）。脚本返回 {lyric/translation/romanic} 或 LRC 文本。</summary>
+    public async Task<(string? Lrc, string? TLrc, string? RLrc)?> GetLyricAsync(string sourceCode, string rawId, string title, string artist, long durationSec, CancellationToken ct = default)
+    {
+        if (!Supports(sourceCode, "lyric")) return null;
+        var musicInfo = new Dictionary<string, object?>
+        {
+            ["hash"] = rawId, ["songmid"] = rawId, ["songId"] = rawId, ["id"] = rawId,
+            ["name"] = title, ["singer"] = artist, ["interval"] = durationSec,
+        };
+        var arg = new Dictionary<string, object?>
+        {
+            ["action"] = "lyric", ["source"] = sourceCode, ["info"] = new Dictionary<string, object?> { ["musicInfo"] = musicInfo },
+        };
+        var result = await InvokeHandlerAsync(arg, ct).ConfigureAwait(false);
+        if (result == null) return null;
+        // 兼容两种返回：字符串（LRC）或 {lyric, translation, romanic}
+        if (result.IsString()) return (result.AsString(), null, null);
+        if (result.IsObject())
+        {
+            var o = result.AsObject();
+            string? Get(string k) => o.Get(k) is var v && v.IsString() ? v.AsString() : null;
+            return (Get("lyric") ?? Get("lrc"), Get("translation") ?? Get("tlyric"), Get("romanic") ?? Get("rlyric"));
+        }
+        return null;
+    }
+
+    /// <summary>封面（pic action）。</summary>
+    public async Task<string?> GetPicUrlAsync(string sourceCode, string rawId, string title, string artist, long durationSec, CancellationToken ct = default)
+    {
+        if (!Supports(sourceCode, "pic")) return null;
+        var musicInfo = new Dictionary<string, object?>
+        {
+            ["hash"] = rawId, ["songmid"] = rawId, ["songId"] = rawId, ["id"] = rawId,
+            ["name"] = title, ["singer"] = artist, ["interval"] = durationSec,
+        };
+        var arg = new Dictionary<string, object?>
+        {
+            ["action"] = "pic", ["source"] = sourceCode, ["info"] = new Dictionary<string, object?> { ["musicInfo"] = musicInfo },
+        };
+        var result = await InvokeHandlerAsync(arg, ct).ConfigureAwait(false);
+        return result?.IsString() == true ? result.AsString() : null;
+    }
+
+    private async Task<JsValue?> InvokeHandlerAsync(object arg, CancellationToken ct)
+    {
+        if (_engine == null || _bridge?.Handlers.TryGetValue("request", out var handler) != true) return null;
+        try
+        {
+            var argJs = JsValue.FromObject(_engine, arg);
+            var result = handler.Call(JsValue.Undefined, new JsValue[] { argJs });
+            if (result.IsPromise())
+            {
+                var settled = await result.UnwrapIfPromiseAsync(ct).ConfigureAwait(false);
+                return settled;
+            }
+            return result;
+        }
+        catch (Exception ex)
+        {
+            LastError = "脚本执行错误：" + ex.Message;
+            return null;
+        }
+    }
+
+    private static List<LxScriptSearchItem>? ParseSearchResult(JsValue? result)
+    {
+        if (result == null || !result.IsArray()) return null;
+        var list = new List<LxScriptSearchItem>();
+        var arr = result.AsArray();
+        for (uint i = 0; i < arr.Length; i++)
+        {
+            var item = arr.Get(i);
+            if (!item.IsObject()) continue;
+            var o = item.AsObject();
+            string Get(string k) => o.Get(k) is var v && v.IsString() ? v.AsString() : "";
+            long GetInterval()
+            {
+                var v = o.Get("interval");
+                if (v.IsNumber()) return (long)v.AsNumber();
+                return 0;
+            }
+            list.Add(new LxScriptSearchItem
+            {
+                Id = Get("id") ?? Get("songmid") ?? Get("hash") ?? Get("songId"),
+                Name = Get("name") ?? Get("title"),
+                Artist = Get("singer") ?? Get("artist"),
+                Album = Get("album"),
+                Source = Get("source"),
+                IntervalSeconds = GetInterval(),
+            });
+        }
+        return list;
+    }
+
+    public void Dispose()
+    {
+        Unload();
+    }
+}
+
+/// <summary>musicSearch 返回项（源短码 + 原始 id + 元信息）。</summary>
+public class LxScriptSearchItem
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Artist { get; set; } = "";
+    public string Album { get; set; } = "";
+    public string Source { get; set; } = "";
+    public long IntervalSeconds { get; set; }
+}

@@ -10,6 +10,29 @@ listener.Prefixes.Add($"http://127.0.0.1:{Port}/");
 listener.Start();
 Console.WriteLine($"[mock] lx-music-api-server 模拟服务已启动: http://127.0.0.1:{Port}");
 
+// lx-music 自定义源脚本（render_api 风格），回调 mock /url 端点
+const string ScriptJs = """
+const { EVENT_NAMES, request, on, send, utils, env, version } = globalThis.lx;
+const httpFetch = (url, options = { method: 'GET' }) => new Promise((resolve, reject) => {
+    request(url, options, (err, resp) => { if (err) return reject(err); resolve(resp); });
+});
+const handleGetMusicUrl = async (source, musicInfo, quality) => {
+    const songId = musicInfo.hash ?? musicInfo.songmid;
+    const r = await httpFetch(`http://127.0.0.1:__PORT__/url/${source}/${songId}/${quality}`, {
+        method: 'GET', headers: { 'Content-Type': 'application/json' },
+    });
+    if (!r.body || isNaN(Number(r.body.code))) throw new Error('unknown error');
+    return r.body.url;
+};
+const musicSources = {};
+['wy','kw','kg','tx','mg'].forEach(s => { musicSources[s] = { name: s, type: 'music', actions: ['musicUrl'], qualitys: ['128k','320k'] }; });
+on(EVENT_NAMES.request, ({ action, source, info }) => {
+    if (action === 'musicUrl') return handleGetMusicUrl(source, info.musicInfo, info.type);
+    return Promise.reject('action not support');
+});
+send(EVENT_NAMES.inited, { status: true, sources: musicSources });
+""";
+
 var serverTask = Task.Run(async () =>
 {
     while (listener.IsListening)
@@ -20,7 +43,16 @@ var serverTask = Task.Run(async () =>
         var path = ctx.Request.Url!.AbsolutePath;
         var q = ctx.Request.QueryString;
         byte[] body;
-        switch (path)
+        if (path.StartsWith("/url/", StringComparison.OrdinalIgnoreCase))
+        {
+            // render_api 风格：/url/{source}/{songmid}/{quality} → {code:0,url:...}
+            var seg = path.Split('/');
+            var src = seg.Length > 2 ? seg[2] : "wy";
+            var quality = seg.Length > 4 ? seg[4] : "320k";
+            var mediaUrl = quality == "128k" ? $"http://media.example.com/{src}_128.mp3" : $"http://media.example.com/{src}_320.mp3";
+            body = Encoding.UTF8.GetBytes($"{{\"code\":0,\"url\":\"{mediaUrl}\",\"source\":\"{src}\"}}");
+        }
+        else switch (path)
         {
             case "/ping":
                 body = Encoding.UTF8.GetBytes("pong");
@@ -52,6 +84,10 @@ var serverTask = Task.Run(async () =>
                     "{\"code\":0,\"data\":{\"lrc\":\"[00:00.00]第一句\\n[00:05.00]第二句\\n[01:00.00]副歌\"," +
                     "\"tlyric\":\"[00:00.05]First line\\n[00:05.05]Second line\"," +
                     "\"rlyric\":\"[00:00.03]Daiichi ku\\n[00:05.03]Daini ku\"}}");
+                break;
+            case "/script.js":
+                // lx-music 自定义源脚本（render_api 风格，回调 mock /url 端点）
+                body = Encoding.UTF8.GetBytes(ScriptJs.Replace("__PORT__", Port.ToString()));
                 break;
             default:
                 ctx.Response.StatusCode = 404;
@@ -155,7 +191,7 @@ try
     var lxPlugin = (CatClawMusic.Core.Interfaces.IOnlineMusicPlugin)plugin;
     var lxLyricProvider = (CatClawMusic.Core.Interfaces.ILyricsProviderPlugin)plugin;
     // 通过公开方法配置服务器（dynamic 调用避免引插件程序集）
-    ((dynamic)plugin).SaveConfig($"http://127.0.0.1:{Port}", 1, "netease");
+    ((dynamic)plugin).SaveConfig($"http://127.0.0.1:{Port}", 1, "netease", "");
 
     var onlineSongs = await lxPlugin.SearchAsync("test", 1, 5);
     Check("插件 SearchAsync 返回 3 首", onlineSongs is { Count: 3 });
@@ -185,6 +221,58 @@ try
         RemoteId = "netease:123",
     });
     Check("非 lx: 前缀不拦截", other == null);
+
+    // ── 阶段 2b：脚本源通过真实插件端到端（验证嵌入 Jint 在插件 DLL 上下文加载）──
+    Console.WriteLine("\n[phase2b] 脚本源经真实插件（嵌入 Jint + AssemblyResolve）");
+    dynamic dplugin = plugin;
+    bool scriptOk = await dplugin.LoadScriptAsync($"http://127.0.0.1:{Port}/script.js");
+    Check("插件加载脚本源", scriptOk);
+    Check("插件 ScriptReady", (bool)dplugin.ScriptReady);
+    // 重新搜索（server 模式，netease 曲目）→ 该曲 GetPlayUrlAsync 应走脚本（wy_320）而非 server（u1_320）
+    var onlineSongs2 = await lxPlugin.SearchAsync("test", 1, 5);
+    Check("脚本模式搜索仍返回 3 首", onlineSongs2 is { Count: 3 });
+    var scriptPlayUrl = await lxPlugin.GetPlayUrlAsync(onlineSongs2![0], 1);
+    Check("播放直链走脚本（wy_320 而非 server u1_320）",
+        scriptPlayUrl == "http://media.example.com/wy_320.mp3", scriptPlayUrl);
+
+    // ── 阶段 3：Jint 脚本引擎 + lx 自定义源 .js（验证 musicUrl 全链路）──
+    Console.WriteLine("\n[phase3] Jint 脚本引擎：lx 自定义源 .js");
+    var mockJs = $$"""
+const { EVENT_NAMES, request, on, send, utils, env, version } = globalThis.lx;
+const httpFetch = (url, options = { method: 'GET' }) => new Promise((resolve, reject) => {
+    request(url, options, (err, resp) => { if (err) return reject(err); resolve(resp); });
+});
+const handleGetMusicUrl = async (source, musicInfo, quality) => {
+    const songId = musicInfo.hash ?? musicInfo.songmid;
+    const r = await httpFetch(`http://127.0.0.1:{{Port}}/url/${source}/${songId}/${quality}`, {
+        method: 'GET', headers: { 'Content-Type': 'application/json' },
+    });
+    if (!r.body || isNaN(Number(r.body.code))) throw new Error('unknown error');
+    return r.body.url;
+};
+const musicSources = {};
+['wy','kw','kg','tx','mg'].forEach(s => { musicSources[s] = { name: s, type: 'music', actions: ['musicUrl'], qualitys: ['128k','320k'] }; });
+on(EVENT_NAMES.request, ({ action, source, info }) => {
+    if (action === 'musicUrl') return handleGetMusicUrl(source, info.musicInfo, info.type);
+    return Promise.reject('action not support');
+});
+send(EVENT_NAMES.inited, { status: true, sources: musicSources });
+""";
+    var host = new LxScriptHost();
+    Check("脚本加载+inited", host.Run(mockJs));
+    Check("脚本声明 5 个源", host.Sources is { SourceCodes.Count: 5 }, host.Sources?.SourceCodes.Count.ToString());
+    Check("脚本支持 wy/musicUrl", host.Supports("wy", "musicUrl"));
+    Check("脚本不支持 wy/musicSearch", !host.Supports("wy", "musicSearch"));
+
+    var scriptUrl = await host.GetMusicUrlAsync("wy", "S1", "Test", "Tester", 240, "320k");
+    Check("脚本 musicUrl 解析（wy 320k）", scriptUrl == "http://media.example.com/wy_320.mp3", scriptUrl);
+    var scriptUrl128 = await host.GetMusicUrlAsync("kw", "K9", "Test", "Tester", 100, "128k");
+    Check("脚本 musicUrl 解析（kw 128k）", scriptUrl128 == "http://media.example.com/kw_128.mp3", scriptUrl128);
+
+    // 平台码映射
+    Check("netease→wy", LxPlatformCodes.ToShort("netease") == "wy");
+    Check("tx→qq", LxPlatformCodes.ToFull("tx") == "qq");
+    Check("bilibili 未知码直传", LxPlatformCodes.ToShort("bilibili") == "bilibili");
 }
 finally
 {

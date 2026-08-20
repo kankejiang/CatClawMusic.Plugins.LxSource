@@ -13,7 +13,10 @@
     <!-- 直接编译插件源码（不依赖 MAUI），验证协议客户端与歌词解析 -->
     <Compile Include="..\..\LxSource\LxApiClient.cs" Link="LxApiClient.cs" />
     <Compile Include="..\..\LxSource\LxLrcParser.cs" Link="LxLrcParser.cs" />
+    <Compile Include="..\..\LxSource\LxScriptEngine.cs" Link="LxScriptEngine.cs" />
     <ProjectReference Include="..\..\..\CatClawMusic\CatClawMusic.Core\CatClawMusic.Core.csproj" />
+    <PackageReference Include="Jint" Version="4.16.0" />
+    <PackageReference Include="Acornima" Version="1.7.0" />
   </ItemGroup>
 
 </Project>

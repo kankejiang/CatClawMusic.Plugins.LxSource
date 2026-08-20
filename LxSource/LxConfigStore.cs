@@ -13,6 +13,9 @@ public class LxConfig
 
     /// <summary>默认音源标识（空 = 服务器默认；如 netease/qq/kuwo/kugou/migu/bilibili）</summary>
     public string DefaultSource { get; set; } = "";
+
+    /// <summary>lx-music 自定义源 .js 脚本地址（空 = 不启用脚本源，纯走 server）</summary>
+    public string ScriptUrl { get; set; } = "";
 }
 
 /// <summary>配置读写：{LocalApplicationData}/CatClawMusic.Maui/lx_source_config.json</summary>

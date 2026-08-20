@@ -113,6 +113,48 @@ public class LxOnlineMusicPage : ContentPage
         };
         serverCard.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
 
+        // ── 脚本源配置卡（.js 源，可选；用于 lx-music 自定义源脚本，播放直链优先走脚本）──
+        var scriptCardTitle = new Label { Text = "自定义源脚本（可选）", FontSize = 13, FontFamily = "OpenSansSemibold", VerticalOptions = LayoutOptions.Center };
+        scriptCardTitle.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+
+        var scriptStatusLabel = new Label { FontSize = 11, MaxLines = 1, VerticalOptions = LayoutOptions.Center };
+        scriptStatusLabel.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
+        scriptStatusLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.ScriptStatus));
+
+        var scriptEntry = new Entry { Placeholder = "https://.../render_api.js" };
+        scriptEntry.SetDynamicResource(Entry.TextColorProperty, "TextPrimaryColor");
+        scriptEntry.SetBinding(Entry.TextProperty, new Binding(nameof(LxOnlineMusicViewModel.ScriptUrl), mode: BindingMode.TwoWay));
+
+        var loadScriptButton = CreateActionButton("加载", _vm.LoadScriptCommand, filled: true);
+        var clearScriptButton = CreateActionButton("清除", _vm.ClearScriptCommand);
+
+        var scriptCard = new Border
+        {
+            Padding = new Thickness(14, 12),
+            Margin = new Thickness(16, 0, 16, 8),
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 14 },
+            Content = new VerticalStackLayout
+            {
+                Spacing = 8,
+                Children =
+                {
+                    new Grid
+                    {
+                        ColumnDefinitions = new ColumnDefinitionCollection
+                        {
+                            new() { Width = GridLength.Star },
+                            new() { Width = GridLength.Auto },
+                        },
+                        Children = { scriptCardTitle, scriptStatusLabel },
+                    }.WithChildColumn(scriptStatusLabel, 1),
+                    scriptEntry,
+                    new HorizontalStackLayout { Spacing = 8, Children = { loadScriptButton, clearScriptButton } },
+                },
+            },
+        };
+        scriptCard.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+
         // ── 音源 chips ──
         var chipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 4, 16, 6) };
         BindableLayout.SetItemsSource(chipsLayout, _vm.SourceChips);
@@ -214,18 +256,20 @@ public class LxOnlineMusicPage : ContentPage
             {
                 new() { Height = GridLength.Auto }, // header
                 new() { Height = GridLength.Auto }, // server card
+                new() { Height = GridLength.Auto }, // script card
                 new() { Height = GridLength.Auto }, // source chips
                 new() { Height = GridLength.Auto }, // search row
                 new() { Height = GridLength.Star }, // content
             },
-            Children = { headerGrid, serverCard, chipsScroll, searchBorder, _songsView, loadingIndicator, tipBorder },
+            Children = { headerGrid, serverCard, scriptCard, chipsScroll, searchBorder, _songsView, loadingIndicator, tipBorder },
         };
         Grid.SetRow(serverCard, 1);
-        Grid.SetRow(chipsScroll, 2);
-        Grid.SetRow(searchBorder, 3);
-        Grid.SetRow(_songsView, 4);
-        Grid.SetRow(loadingIndicator, 4);
-        Grid.SetRow(tipBorder, 4);
+        Grid.SetRow(scriptCard, 2);
+        Grid.SetRow(chipsScroll, 3);
+        Grid.SetRow(searchBorder, 4);
+        Grid.SetRow(_songsView, 5);
+        Grid.SetRow(loadingIndicator, 5);
+        Grid.SetRow(tipBorder, 5);
 
         Content = contentGrid;
     }

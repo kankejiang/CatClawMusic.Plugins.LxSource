@@ -30,6 +30,12 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     private string _serverStatus = "未配置服务器";
 
     [ObservableProperty]
+    private string _scriptUrl = "";
+
+    [ObservableProperty]
+    private string _scriptStatus = "未配置脚本源";
+
+    [ObservableProperty]
     private string _searchQuery = "";
 
     [ObservableProperty]
@@ -56,6 +62,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         _services = services;
 
         ServerUrl = plugin.Config.ServerUrl;
+        ScriptUrl = plugin.Config.ScriptUrl;
         QualityText = QualityLabel(plugin.Config.QualityLevel);
         foreach (var name in SourceOptions)
         {
@@ -64,6 +71,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
             SourceChips.Add(new LxSourceChipItem(name, selected));
         }
         ServerStatus = string.IsNullOrWhiteSpace(ServerUrl) ? "未配置服务器" : "已配置 · 待验证";
+        ScriptStatus = string.IsNullOrWhiteSpace(ScriptUrl) ? "未配置脚本源" : "待加载";
     }
 
     private static string QualityLabel(int q) => q switch
@@ -90,9 +98,20 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         if (!ct.IsCancellationRequested) HasTip = false;
     }
 
-    /// <summary>页面出现时自动 ping（已配置服务器才执行）</summary>
+    /// <summary>页面出现时自动 ping（已配置服务器才执行）+ 同步脚本状态</summary>
     public async Task AutoPingAsync()
     {
+        // 脚本状态同步（InitializeAsync 可能已后台加载完成）
+        if (_plugin.ScriptReady)
+        {
+            var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
+            ScriptStatus = $"已加载 · {n} 个源";
+        }
+        else if (!string.IsNullOrWhiteSpace(_plugin.Config.ScriptUrl))
+        {
+            ScriptStatus = "加载中…";
+        }
+
         if (!_plugin.Client.HasServer || _pinging) return;
         _pinging = true;
         ServerStatus = "连接中…";
@@ -103,7 +122,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
 
     // ── 配置 ──
 
-    /// <summary>保存服务器地址与音源选择（立即生效并持久化）</summary>
+    /// <summary>保存服务器地址与音源选择（立即生效并持久化；同时保存脚本源地址）</summary>
     [RelayCommand]
     private void SaveConfig()
     {
@@ -117,9 +136,56 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         }
         var source = SourceChips.FirstOrDefault(c => c.IsSelected)?.Name ?? "";
         if (source == "自动") source = "";
-        _plugin.SaveConfig(url, _plugin.Config.QualityLevel, source);
+        var script = (ScriptUrl ?? "").Trim();
+        _plugin.SaveConfig(url, _plugin.Config.QualityLevel, source, script);
         ServerStatus = "已配置 · 待验证";
+        ScriptStatus = string.IsNullOrWhiteSpace(script) ? "未配置脚本源" : "待加载";
         ShowTip("已保存 ✓");
+    }
+
+    /// <summary>加载/重载 .js 脚本源（拉取+执行；成功后播放直链优先走脚本）</summary>
+    [RelayCommand]
+    private async Task LoadScriptAsync()
+    {
+        var script = (ScriptUrl ?? "").Trim();
+        if (script.Length == 0)
+        {
+            await ClearScriptAsync();
+            return;
+        }
+        if (!script.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            && !script.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            ShowTip("脚本地址需以 http:// 或 https:// 开头");
+            return;
+        }
+        ScriptStatus = "加载中…";
+        var ok = await _plugin.LoadScriptAsync(script);
+        if (ok)
+        {
+            _plugin.Config.ScriptUrl = script;
+            LxConfigStore.Save(_plugin.Config);
+            var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
+            ScriptStatus = $"已加载 · {n} 个源";
+            ShowTip($"脚本加载成功，声明 {n} 个源");
+        }
+        else
+        {
+            ScriptStatus = "加载失败 ✗";
+            ShowTip("脚本加载失败：" + (_plugin.Script?.LastError ?? "未知错误"));
+        }
+    }
+
+    /// <summary>清除脚本源（清空字段 + 释放脚本宿主 + 持久化）</summary>
+    [RelayCommand]
+    private async Task ClearScriptAsync()
+    {
+        ScriptUrl = "";
+        _plugin.Config.ScriptUrl = "";
+        LxConfigStore.Save(_plugin.Config);
+        await _plugin.LoadScriptAsync("");
+        ScriptStatus = "未配置脚本源";
+        ShowTip("已清除脚本源");
     }
 
     /// <summary>测试连接（未保存也能测，仅改客户端地址；失败时恢复已保存地址避免污染搜索）</summary>
@@ -149,7 +215,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     private void CycleQuality()
     {
         var q = (_plugin.Config.QualityLevel + 1) % 3;
-        _plugin.SaveConfig(_plugin.Config.ServerUrl, q, _plugin.Config.DefaultSource);
+        _plugin.SaveConfig(_plugin.Config.ServerUrl, q, _plugin.Config.DefaultSource, _plugin.Config.ScriptUrl);
         QualityText = QualityLabel(q);
         ShowTip($"音质已切换：{QualityText}");
     }
@@ -160,7 +226,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     {
         foreach (var c in SourceChips) c.IsSelected = ReferenceEquals(c, chip);
         var source = chip.Name == "自动" ? "" : chip.Name;
-        _plugin.SaveConfig(_plugin.Config.ServerUrl, _plugin.Config.QualityLevel, source);
+        _plugin.SaveConfig(_plugin.Config.ServerUrl, _plugin.Config.QualityLevel, source, _plugin.Config.ScriptUrl);
         ShowTip($"音源已切换：{chip.Name}");
     }
 
