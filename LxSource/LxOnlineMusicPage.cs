@@ -270,9 +270,15 @@ public class LxOnlineMusicPage : ContentPage
             TranslationY = SheetHiddenY,
         };
         sheet.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
-        sheet.SetBinding(VisualElement.TranslationYProperty,
-            new Binding(nameof(LxOnlineMusicViewModel.IsSettingsOpen))
-            { Converter = SheetOpenToTranslationConverter.Instance, ConverterParameter = SheetHiddenY });
+        // 打开/关闭动画（IsSettingsOpen 变化 → TranslateTo 平滑过渡）
+        _vm.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(LxOnlineMusicViewModel.IsSettingsOpen))
+            {
+                var target = _vm.IsSettingsOpen ? 0.0 : SheetHiddenY;
+                _ = sheet.TranslateTo(0, target, 220u, Easing.CubicOut);
+            }
+        };
 
         // sheet 顶部拖动条 + 关闭
         var dragBar = new BoxView
@@ -281,10 +287,11 @@ public class LxOnlineMusicPage : ContentPage
             WidthRequest = 36,
             HorizontalOptions = LayoutOptions.Center,
             Margin = new Thickness(0, 8, 0, 8),
-            Color = Color.FromArgb("#80808080"),
+            Color = Color.FromArgb("#8A808080"),
         };
-        dragBar.SetDynamicResource(VisualElement.BackgroundColorProperty, "TextHintColor");
 
+        var closeLabel = new Label { Text = "✕", FontSize = 16 };
+        closeLabel.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
         var closeButton = new Border
         {
             Padding = new Thickness(12, 6),
@@ -292,10 +299,9 @@ public class LxOnlineMusicPage : ContentPage
             StrokeShape = new RoundRectangle { CornerRadius = 14 },
             HorizontalOptions = LayoutOptions.End,
             Margin = new Thickness(0, -8, 12, 0),
-            Content = new Label { Text = "✕", FontSize = 16 },
+            Content = closeLabel,
         };
         closeButton.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
-        closeButton.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
         var closeTap = new TapGestureRecognizer();
         closeTap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(nameof(LxOnlineMusicViewModel.CloseSettingsCommand)));
         closeButton.GestureRecognizers.Add(closeTap);
@@ -462,7 +468,7 @@ public class LxOnlineMusicPage : ContentPage
         {
             Binding = new Binding(nameof(LxOnlineMusicViewModel.QualityText)),
             Value = label,
-            Setters = { new Setter { Property = Border.BackgroundColorProperty, Value = Application.Current?.Resources["PrimaryColor"] } },
+            Setters = { new Setter { Property = Border.BackgroundColorProperty, Value = LxUiKit.GetPrimaryColor() } },
         });
         var tap = new TapGestureRecognizer();
         tap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(nameof(LxOnlineMusicViewModel.SetQualityCommand)));

@@ -13,6 +13,14 @@ namespace CatClawMusic.Plugins.LxSource;
 /// </summary>
 public static class LxUiKit
 {
+    /// <summary>宿主主题主色（"PrimaryColor" 资源），取不到时回落默认紫色。</summary>
+    public static Color GetPrimaryColor()
+    {
+        if (Application.Current?.Resources.TryGetValue("PrimaryColor", out var v) == true && v is Color c)
+            return c;
+        return Color.FromArgb("#7B68EE");
+    }
+
     /// <summary>歌曲行：封面 40 + 标题/艺术家 + 时长右对齐（点击由 CollectionView SelectionChanged 处理）</summary>
     public static View CreateSongItemTemplate()
     {
@@ -84,7 +92,7 @@ public static class LxUiKit
             {
                 Binding = new Binding(nameof(LxSourceChipItem.IsSelected)),
                 Value = true,
-                Setters = { new Setter { Property = Border.BackgroundColorProperty, Value = Application.Current?.Resources["PrimaryColor"] } },
+                Setters = { new Setter { Property = Border.BackgroundColorProperty, Value = GetPrimaryColor() } },
             });
             chipLabel.Triggers.Add(new DataTrigger(typeof(Label))
             {
