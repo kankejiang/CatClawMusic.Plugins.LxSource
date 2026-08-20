@@ -124,12 +124,48 @@ public partial class LxOnlineMusicViewModel : ObservableObject
                 return;
             }
             foreach (var s in songs) Songs.Add(s);
+            EnrichCoversAsync(songs).ContinueWith(_ => { }, TaskScheduler.Default);
         }
         finally
         {
             IsBusy = false;
         }
     }
+
+    /// <summary>后台并发（限 4）预取歌曲封面（酷我 rid_pic API），完成后重建 Songs 触发列表刷新。</summary>
+    private async Task EnrichCoversAsync(IReadOnlyList<OnlineSong> songs)
+    {
+        try
+        {
+            var tasks = songs.Select(LoadCoverAsync).ToArray();
+            await Task.WhenAll(tasks);
+            // 封面就绪 → 重建集合触发 CollectionView 刷新
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                Songs.Clear();
+                foreach (var s in songs) Songs.Add(s);
+            });
+        }
+        catch { /* 封面预取失败不影响列表 */ }
+    }
+
+    private static readonly SemaphoreSlim CoverGate = new(4, 4);
+
+    private static async Task LoadCoverAsync(OnlineSong s)
+    {
+        if (s == null || !string.IsNullOrWhiteSpace(s.CoverUrl)) return;
+        if (s.Id == null || !s.Id.StartsWith("kw:", StringComparison.OrdinalIgnoreCase)) return;
+        var songmid = s.Id[3..];
+        await CoverGate.WaitAsync();
+        try
+        {
+            var url = await LxKuwoApi.GetPicAsync(songmid);
+            if (!string.IsNullOrWhiteSpace(url)) s.CoverUrl = url;
+        }
+        catch { }
+        finally { CoverGate.Release(); }
+    }
+
 
     // ── 搜索 ──
 
@@ -150,6 +186,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
                 return;
             }
             foreach (var s in songs) Songs.Add(s);
+            EnrichCoversAsync(songs).ContinueWith(_ => { }, TaskScheduler.Default);
             if (songs.Count == 0) ShowTip("没有找到相关歌曲");
             // 搜索后清掉榜单选中态（列表语义已变）
             foreach (var c in BoardChips) c.IsSelected = false;
