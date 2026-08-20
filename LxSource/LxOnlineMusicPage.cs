@@ -81,6 +81,7 @@ public class LxOnlineMusicPage : ContentPage
             },
             ColumnSpacing = 8,
             Padding = new Thickness(16, 12, 16, 8),
+            VerticalOptions = LayoutOptions.Start,  // 顶部 header 不参与剩余空间分配
             Children = { backButton, titleLabel, settingsButton },
         };
         Grid.SetColumn(titleLabel, 1);
@@ -157,7 +158,8 @@ public class LxOnlineMusicPage : ContentPage
         return contentGrid;
     }
 
-    /// <summary>能力概览卡：根据 _vm.Capabilities 渲染每源的名称 + actions 小 chips</summary>
+    /// <summary>能力概览卡：根据 _vm.Capabilities 渲染每源的名称 + actions 小 chips。
+    /// 布局：Grid 两行（summary 自动高 + cardScroll 占满剩余可滚动），空状态覆盖层叠在上面。</summary>
     private View BuildCapabilityOverview()
     {
         var summaryLabel = new Label
@@ -218,13 +220,13 @@ public class LxOnlineMusicPage : ContentPage
             return cardBorder;
         }));
 
-        var scroll = new ScrollView
+        // cardScroll 放在 Grid Star 行：ScrollView 有明确高度约束才能滚动，避免
+        // 嵌在 VerticalStackLayout 里内容超高被裁剪。
+        var cardScroll = new ScrollView
         {
-            Content = new VerticalStackLayout
-            {
-                Spacing = 4,
-                Children = { summaryLabel, cardList },
-            },
+            VerticalScrollBarVisibility = ScrollBarVisibility.Never,
+            Content = cardList,
+            VerticalOptions = LayoutOptions.Fill,
         };
 
         // 空状态：未导入脚本
@@ -243,13 +245,24 @@ public class LxOnlineMusicPage : ContentPage
         {
             Children = { emptyLabel },
         };
+        // CapabilitySummary 为空（未导入脚本/无声明源）→ 显示空状态提示
         emptyOverlay.SetBinding(VisualElement.IsVisibleProperty,
             new Binding(nameof(LxOnlineMusicViewModel.CapabilitySummary))
             { Converter = StringNullOrEmptyToBoolConverter.Instance });
 
         var container = new Grid
         {
-            Children = { scroll, emptyOverlay },
+            RowDefinitions = new RowDefinitionCollection
+            {
+                new() { Height = GridLength.Auto },
+                new() { Height = GridLength.Star },
+            },
+            Children =
+            {
+                summaryLabel.GridRow(0),
+                cardScroll.GridRow(1),
+                emptyOverlay.GridRowSpan(2),
+            },
         };
         return container;
     }
@@ -443,6 +456,11 @@ public class LxOnlineMusicPage : ContentPage
             Children = { overlay, sheet },
         };
         Grid.SetRowSpan(overlay, 1);
+        // 关键：sheet 未打开时容器必须穿透触摸（否则全屏 Grid 会拦截主页面所有点击，
+        // 齿轮/音源 chips 全部失效）；打开时再接收输入。
+        container.SetBinding(VisualElement.InputTransparentProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.IsSettingsOpen))
+            { Converter = InverseBoolConverter.Instance });
         return container;
     }
 
@@ -594,12 +612,22 @@ internal sealed class SheetOpenToTranslationConverter : IValueConverter
         => throw new NotSupportedException();
 }
 
-/// <summary>字符串非空 → true（用于能力概览卡空状态）。</summary>
+/// <summary>字符串为 null/空 → true（用于能力概览卡空状态显示）。</summary>
 internal sealed class StringNullOrEmptyToBoolConverter : IValueConverter
 {
     public static readonly StringNullOrEmptyToBoolConverter Instance = new();
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
-        => !string.IsNullOrEmpty(value as string);
+        => string.IsNullOrEmpty(value as string);
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
+}
+
+/// <summary>bool → !bool（用于 InputTransparent 反转：sheet 打开=false 可交互，关闭=true 穿透）。</summary>
+internal sealed class InverseBoolConverter : IValueConverter
+{
+    public static readonly InverseBoolConverter Instance = new();
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => value is bool b && !b;
     public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
         => throw new NotSupportedException();
 }
@@ -618,12 +646,24 @@ internal sealed class NonEmptyPrefixConverter : IValueConverter
         => throw new NotSupportedException();
 }
 
-/// <summary>小工具：链式设置 Grid 列</summary>
+/// <summary>小工具：链式设置 Grid 列/行</summary>
 internal static class PageGridExtensions
 {
     public static Grid WithChildColumn(this Grid grid, View child, int column)
     {
         Grid.SetColumn(child, column);
         return grid;
+    }
+
+    public static T GridRow<T>(this T view, int row) where T : BindableObject
+    {
+        Grid.SetRow(view, row);
+        return view;
+    }
+
+    public static T GridRowSpan<T>(this T view, int span) where T : BindableObject
+    {
+        Grid.SetRowSpan(view, span);
+        return view;
     }
 }
