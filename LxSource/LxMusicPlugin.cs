@@ -24,7 +24,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     public string PluginId => "lxSource";
     public string Name => "LX 源音乐";
-    public string Version => "0.3.0";
+    public string Version => "0.4.0";
     public string Author => "CatClawMusic";
     public string Description => "内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本（在线/本地导入）：支持网易云/QQ/酷我/酷狗等，播放直链/歌词（原文+翻译+罗马音）/封面/多音质";
     public List<string> Capabilities => new() { "search", "play", "lyrics", "roma", "quality", "script" };
