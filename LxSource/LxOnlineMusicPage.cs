@@ -8,16 +8,16 @@ using Microsoft.Maui.Storage;
 namespace CatClawMusic.Plugins.LxSource;
 
 /// <summary>
-/// LX 源音乐页面：右上齿轮打开底部 sheet（音源脚本导入 + 默认源 + 音质）；
-/// 主页面展示已加载脚本的源能力概览卡。
-/// <para>设计参考 lx-music-mobile（lyswhut/lx-music-mobile）主页：
-/// 设置作为独立入口 + 主页面按音源能力动态渲染内容。</para>
+/// LX 源音乐页面 —— 布局照搬 lx-music-mobile（lyswhut/lx-music-mobile）主页：
+/// 搜索框（酷我搜索）+ 榜单横向 chips（热歌榜/飙升榜/新歌榜…）+ 歌曲列表（点歌入队播放，
+/// 播放直链由 ⚙ 设置导入的自定义源脚本解析）。设置入口：右上角 ⚙ → 底部 sheet。
 /// <para>全部 C# 代码构建 UI（不用 XAML，避免跨程序集编译问题）。</para>
 /// </summary>
 public class LxOnlineMusicPage : ContentPage
 {
     private readonly LxOnlineMusicViewModel _vm;
     private readonly IServiceProvider _services;
+    private CollectionView _songsView = null!;
     private static readonly double SheetHiddenY = 480;
 
     public LxOnlineMusicPage(LxOnlineMusicViewModel vm, IServiceProvider services)
@@ -31,21 +31,10 @@ public class LxOnlineMusicPage : ContentPage
             ? (Color)bg
             : Color.FromArgb("#0B0D20");
 
-        // ── 顶部：返回 + 标题 + 齿轮设置入口 ──
-        var headerGrid = BuildHeader();
-
-        // ── 主页面内容（音源 chips + 能力概览卡 + 加载指示器 + 轻提示）──
         var mainContent = BuildMainContent();
-
-        // ── 底部设置 sheet（齿轮打开：脚本导入 + 默认源 + 音质）──
         var sheetContainer = BuildSettingsSheet();
 
-        // ── 组装：主页面在底层，sheet 容器覆盖在上 ──
-        var root = new Grid
-        {
-            Children = { mainContent, sheetContainer },
-        };
-        Content = root;
+        Content = new Grid { Children = { mainContent, sheetContainer } };
     }
 
     protected override void OnAppearing()
@@ -54,60 +43,96 @@ public class LxOnlineMusicPage : ContentPage
         _vm.OnAppearing();
     }
 
-    // ── 顶部 header ──
-
-    private Grid BuildHeader()
-    {
-        var backButton = CreateBackButton();
-        var titleLabel = new Label
-        {
-            Text = "LX 源音乐",
-            FontSize = 17,
-            FontFamily = "OpenSansSemibold",
-            VerticalOptions = LayoutOptions.Center,
-            HorizontalOptions = LayoutOptions.Center,
-        };
-        titleLabel.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
-
-        var settingsButton = CreateSettingsButton();
-
-        var grid = new Grid
-        {
-            ColumnDefinitions = new ColumnDefinitionCollection
-            {
-                new() { Width = GridLength.Auto },
-                new() { Width = GridLength.Star },
-                new() { Width = GridLength.Auto },
-            },
-            ColumnSpacing = 8,
-            Padding = new Thickness(16, 12, 16, 8),
-            VerticalOptions = LayoutOptions.Start,  // 顶部 header 不参与剩余空间分配
-            Children = { backButton, titleLabel, settingsButton },
-        };
-        Grid.SetColumn(titleLabel, 1);
-        Grid.SetColumn(settingsButton, 2);
-        return grid;
-    }
-
-    /// <summary>主页面：音源 chips + 能力概览卡 + 加载指示器 + 轻提示</summary>
+    /// <summary>主内容：header + 搜索框 + 榜单 chips + 歌曲列表 + loading/tip</summary>
     private Grid BuildMainContent()
     {
-        // ── 音源 chips ──
-        var chipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 4, 16, 6) };
-        BindableLayout.SetItemsSource(chipsLayout, _vm.SourceChips);
-        BindableLayout.SetItemTemplate(chipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SelectSourceCommand)));
-        var chipsScroll = new ScrollView
+        // ── header：返回 + 标题 + ⚙ ──
+        var header = BuildHeader();
+
+        // ── 搜索框（酷我搜索）──
+        var searchEntry = new Entry { Placeholder = "搜索歌曲 / 歌手 / 专辑…" };
+        searchEntry.SetDynamicResource(Entry.TextColorProperty, "TextPrimaryColor");
+        searchEntry.SetDynamicResource(Entry.PlaceholderColorProperty, "TextHintColor");
+        searchEntry.SetBinding(Entry.TextProperty, new Binding(nameof(LxOnlineMusicViewModel.SearchQuery), mode: BindingMode.TwoWay));
+        searchEntry.ReturnType = ReturnType.Search;
+        searchEntry.Completed += async (_, _) => await _vm.SearchCommand.ExecuteAsync(null);
+
+        var searchButton = new Label
+        {
+            Text = "🔍",
+            FontSize = 15,
+            VerticalOptions = LayoutOptions.Center,
+            Margin = new Thickness(4, 0, 4, 0),
+        };
+        searchButton.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
+        var searchTap = new TapGestureRecognizer();
+        searchTap.SetBinding(TapGestureRecognizer.CommandProperty, nameof(LxOnlineMusicViewModel.SearchCommand));
+        searchButton.GestureRecognizers.Add(searchTap);
+
+        var searchBorder = new Border
+        {
+            Padding = new Thickness(14, 4, 6, 4),
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 16 },
+            Margin = new Thickness(16, 0, 16, 6),
+            VerticalOptions = LayoutOptions.Start,
+            Content = new Grid
+            {
+                ColumnDefinitions = new ColumnDefinitionCollection
+                {
+                    new() { Width = GridLength.Star },
+                    new() { Width = GridLength.Auto },
+                },
+                ColumnSpacing = 6,
+                Children = { searchEntry, searchButton },
+            }.WithChildColumn(searchButton, 1),
+        };
+        searchBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+
+        // ── 榜单 chips（横向滚动）──
+        var boardChipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 2, 16, 4) };
+        BindableLayout.SetItemsSource(boardChipsLayout, _vm.BoardChips);
+        BindableLayout.SetItemTemplate(boardChipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SelectBoardCommand)));
+        var boardChipsScroll = new ScrollView
         {
             Orientation = ScrollOrientation.Horizontal,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Never,
-            HeightRequest = 38,
-            Content = chipsLayout,
+            HeightRequest = 36,
+            VerticalOptions = LayoutOptions.Start,
+            Content = boardChipsLayout,
         };
 
-        // ── 能力概览卡 ──
-        var overviewView = BuildCapabilityOverview();
+        // ── 列表标题 + 歌曲列表 ──
+        var listTitleLabel = new Label
+        {
+            FontSize = 13,
+            FontFamily = "OpenSansSemibold",
+            Padding = new Thickness(20, 6, 20, 4),
+            VerticalOptions = LayoutOptions.Start,
+        };
+        listTitleLabel.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
+        listTitleLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.ListTitle));
 
-        // ── 加载指示器 ──
+        _songsView = new CollectionView
+        {
+            SelectionMode = SelectionMode.Single,
+            ItemsLayout = new LinearItemsLayout(ItemsLayoutOrientation.Vertical),
+            VerticalOptions = LayoutOptions.Fill,
+            EmptyView = new Label
+            {
+                Text = "加载中…",
+                FontSize = 12,
+                HorizontalTextAlignment = TextAlignment.Center,
+                VerticalTextAlignment = TextAlignment.Center,
+                Margin = new Thickness(24, 40, 24, 0),
+            },
+        };
+        ((Label)_songsView.EmptyView).SetDynamicResource(Label.TextColorProperty, "TextHintColor");
+        _songsView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.Songs));
+        _songsView.ItemTemplate = new DataTemplate(LxUiKit.CreateSongItemTemplate);
+        _songsView.SelectionChanged += OnSongSelected;
+
+        // ── loading / tip ──
         var loadingIndicator = new ActivityIndicator
         {
             WidthRequest = 36,
@@ -119,7 +144,6 @@ public class LxOnlineMusicPage : ContentPage
         loadingIndicator.SetBinding(ActivityIndicator.IsRunningProperty, nameof(LxOnlineMusicViewModel.IsBusy));
         loadingIndicator.SetBinding(ActivityIndicator.IsVisibleProperty, nameof(LxOnlineMusicViewModel.IsBusy));
 
-        // ── 轻提示条 ──
         var tipLabel = new Label
         {
             FontSize = 12,
@@ -142,139 +166,69 @@ public class LxOnlineMusicPage : ContentPage
         };
         tipBorder.SetBinding(VisualElement.IsVisibleProperty, nameof(LxOnlineMusicViewModel.HasTip));
 
-        // 主内容栈：header + chips + 概览（最后一个 VerticalOptions=Fill 占满剩余空间）
-        var stack = new VerticalStackLayout
-        {
-            Spacing = 0,
-            Children = { BuildHeader(), chipsScroll, overviewView },
-        };
-
-        var contentGrid = new Grid
-        {
-            Children = { stack, loadingIndicator, tipBorder },
-        };
-        chipsScroll.VerticalOptions = LayoutOptions.Start;
-        overviewView.VerticalOptions = LayoutOptions.Fill;
-        return contentGrid;
-    }
-
-    /// <summary>能力概览卡：根据 _vm.Capabilities 渲染每源的名称 + actions 小 chips。
-    /// 布局：Grid 两行（summary 自动高 + cardScroll 占满剩余可滚动），空状态覆盖层叠在上面。</summary>
-    private View BuildCapabilityOverview()
-    {
-        var summaryLabel = new Label
-        {
-            FontSize = 12,
-            MaxLines = 2,
-            Padding = new Thickness(20, 16, 20, 6),
-        };
-        summaryLabel.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
-        summaryLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.CapabilitySummary));
-
-        var cardList = new VerticalStackLayout
-        {
-            Spacing = 8,
-            Padding = new Thickness(16, 4, 16, 16),
-        };
-        BindableLayout.SetItemsSource(cardList, _vm.Capabilities);
-        BindableLayout.SetItemTemplate(cardList, new DataTemplate(() =>
-        {
-            var nameLabel = new Label
-            {
-                FontSize = 14,
-                FontFamily = "OpenSansSemibold",
-            };
-            nameLabel.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
-            nameLabel.SetBinding(Label.TextProperty, nameof(LxCapabilityItem.Name));
-
-            // action 小 chips（横向排列；actions 不会很多，简单处理）
-            var actionsHost = new HorizontalStackLayout { Spacing = 4 };
-            actionsHost.SetBinding(BindableLayout.ItemsSourceProperty, new Binding(nameof(LxCapabilityItem.Actions)));
-            BindableLayout.SetItemTemplate(actionsHost, new DataTemplate(() =>
-            {
-                var chipBorder = new Border
-                {
-                    Padding = new Thickness(8, 3),
-                    StrokeThickness = 0,
-                    StrokeShape = new RoundRectangle { CornerRadius = 8 },
-                };
-                chipBorder.SetDynamicResource(Border.BackgroundColorProperty, "PrimaryColor");
-                var chipLabel = new Label { FontSize = 10, TextColor = Colors.White };
-                chipLabel.SetBinding(Label.TextProperty, ".");
-                chipBorder.Content = chipLabel;
-                return chipBorder;
-            }));
-
-            var cardBorder = new Border
-            {
-                Padding = new Thickness(14, 12),
-                StrokeThickness = 0,
-                StrokeShape = new RoundRectangle { CornerRadius = 14 },
-            };
-            cardBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
-            cardBorder.Content = new VerticalStackLayout
-            {
-                Spacing = 8,
-                Children = { nameLabel, actionsHost },
-            };
-            return cardBorder;
-        }));
-
-        // cardScroll 放在 Grid Star 行：ScrollView 有明确高度约束才能滚动，避免
-        // 嵌在 VerticalStackLayout 里内容超高被裁剪。
-        var cardScroll = new ScrollView
-        {
-            VerticalScrollBarVisibility = ScrollBarVisibility.Never,
-            Content = cardList,
-            VerticalOptions = LayoutOptions.Fill,
-        };
-
-        // 空状态：未导入脚本
-        var emptyLabel = new Label
-        {
-            Text = "未导入音源脚本\n点击右上角 ⚙ 设置导入",
-            FontSize = 13,
-            HorizontalTextAlignment = TextAlignment.Center,
-            VerticalTextAlignment = TextAlignment.Center,
-            MaxLines = 3,
-            Margin = new Thickness(24, 48, 24, 0),
-        };
-        emptyLabel.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
-
-        var emptyOverlay = new Grid
-        {
-            Children = { emptyLabel },
-        };
-        // CapabilitySummary 为空（未导入脚本/无声明源）→ 显示空状态提示
-        emptyOverlay.SetBinding(VisualElement.IsVisibleProperty,
-            new Binding(nameof(LxOnlineMusicViewModel.CapabilitySummary))
-            { Converter = StringNullOrEmptyToBoolConverter.Instance });
-
-        var container = new Grid
+        // 布局：Grid 行（header / 搜索框 / 榜单chips / 标题 / 列表*），loading/tip 覆盖
+        var grid = new Grid
         {
             RowDefinitions = new RowDefinitionCollection
             {
-                new() { Height = GridLength.Auto },
-                new() { Height = GridLength.Star },
+                new() { Height = GridLength.Auto },  // 0 header
+                new() { Height = GridLength.Auto },  // 1 搜索框
+                new() { Height = GridLength.Auto },  // 2 榜单 chips
+                new() { Height = GridLength.Auto },  // 3 列表标题
+                new() { Height = GridLength.Star },  // 4 歌曲列表
             },
             Children =
             {
-                summaryLabel.GridRow(0),
-                cardScroll.GridRow(1),
-                emptyOverlay.GridRowSpan(2),
+                header.GridRow(0),
+                searchBorder.GridRow(1),
+                boardChipsScroll.GridRow(2),
+                listTitleLabel.GridRow(3),
+                _songsView.GridRow(4),
+                loadingIndicator.GridRow(4),
+                tipBorder.GridRowSpan(5),
             },
         };
-        return container;
+        return grid;
     }
 
-    // ── 设置 sheet（半屏底部弹出）──
+    // ── header ──
+
+    private Grid BuildHeader()
+    {
+        var backButton = CreateBackButton();
+        var titleLabel = new Label
+        {
+            Text = "LX 源音乐",
+            FontSize = 17,
+            FontFamily = "OpenSansSemibold",
+            VerticalOptions = LayoutOptions.Center,
+            HorizontalOptions = LayoutOptions.Center,
+        };
+        titleLabel.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+
+        var settingsButton = CreateSettingsButton();
+
+        return new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitionCollection
+            {
+                new() { Width = GridLength.Auto },
+                new() { Width = GridLength.Star },
+                new() { Width = GridLength.Auto },
+            },
+            ColumnSpacing = 8,
+            Padding = new Thickness(16, 12, 16, 8),
+            VerticalOptions = LayoutOptions.Start,
+            Children = { backButton, titleLabel, settingsButton },
+        }.WithChildColumn(titleLabel, 1).WithChildColumn(settingsButton, 2);
+    }
+
+    // ── 设置 sheet（半屏底部弹出：脚本导入 + 默认源 + 音质）──
 
     private Grid BuildSettingsSheet()
     {
-        // 半屏 sheet 面板（顶角圆角，从屏幕外 TranslationY 弹出）
         var sheet = new Border
         {
-            BackgroundColor = Color.FromArgb("#F214171F"),
             StrokeThickness = 0,
             StrokeShape = new RoundRectangle { CornerRadius = new CornerRadius(20, 20, 0, 0) },
             Padding = new Thickness(0),
@@ -283,7 +237,6 @@ public class LxOnlineMusicPage : ContentPage
             TranslationY = SheetHiddenY,
         };
         sheet.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
-        // 打开/关闭动画（IsSettingsOpen 变化 → TranslateTo 平滑过渡）
         _vm.PropertyChanged += (s, e) =>
         {
             if (e.PropertyName == nameof(LxOnlineMusicViewModel.IsSettingsOpen))
@@ -293,7 +246,6 @@ public class LxOnlineMusicPage : ContentPage
             }
         };
 
-        // sheet 顶部拖动条 + 关闭
         var dragBar = new BoxView
         {
             HeightRequest = 4,
@@ -319,18 +271,6 @@ public class LxOnlineMusicPage : ContentPage
         closeTap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(nameof(LxOnlineMusicViewModel.CloseSettingsCommand)));
         closeButton.GestureRecognizers.Add(closeTap);
 
-        var sheetHeader = new Grid
-        {
-            ColumnDefinitions = new ColumnDefinitionCollection
-            {
-                new() { Width = GridLength.Star },
-                new() { Width = GridLength.Auto },
-            },
-            Children = { new VerticalStackLayout { HorizontalOptions = LayoutOptions.Center, Children = { dragBar } }, closeButton },
-        };
-        Grid.SetColumn(closeButton, 1);
-
-        // sheet 标题 + 状态
         var sheetTitle = new Label
         {
             Text = "音源脚本设置",
@@ -349,9 +289,9 @@ public class LxOnlineMusicPage : ContentPage
         sheetStatus.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
         sheetStatus.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.ScriptStatus));
 
-        // URL 输入 + 导入按钮
         var urlEntry = new Entry { Placeholder = "https://.../render_api.js（在线地址）" };
         urlEntry.SetDynamicResource(Entry.TextColorProperty, "TextPrimaryColor");
+        urlEntry.SetDynamicResource(Entry.PlaceholderColorProperty, "TextHintColor");
         urlEntry.SetBinding(Entry.TextProperty, new Binding(nameof(LxOnlineMusicViewModel.ScriptUrl), mode: BindingMode.TwoWay));
         urlEntry.ReturnType = ReturnType.Go;
         urlEntry.Completed += async (_, _) => await _vm.ImportOnlineCommand.ExecuteAsync(null);
@@ -361,38 +301,24 @@ public class LxOnlineMusicPage : ContentPage
         importLocalButton.GestureRecognizers.Add(MakeTapForLocalImport());
         var clearButton = CreateActionButton("清除", _vm.ClearScriptCommand);
 
-        var urlBlock = new VerticalStackLayout
-        {
-            Spacing = 8,
-            Padding = new Thickness(20, 0, 20, 12),
-            Children =
-            {
-                urlEntry,
-                new HorizontalStackLayout { Spacing = 8, Children = { importOnlineButton, importLocalButton, clearButton } },
-            },
-        };
-
-        // 当前脚本文件路径（如果有）
         var fileLabel = new Label { FontSize = 10, MaxLines = 1, Margin = new Thickness(20, 0, 20, 8) };
         fileLabel.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
         fileLabel.SetBinding(Label.TextProperty,
             new Binding(nameof(LxOnlineMusicViewModel.ScriptFilePath))
             { Converter = NonEmptyPrefixConverter.Instance, ConverterParameter = "本地脚本：" });
 
-        // 默认源
         var sourceLabel = new Label
         {
-            Text = "默认音源",
+            Text = "默认音源（脚本解析直链时优先使用）",
             FontSize = 12,
             FontFamily = "OpenSansSemibold",
-            Margin = new Thickness(20, 8, 20, 4),
+            Margin = new Thickness(20, 4, 20, 4),
         };
         sourceLabel.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
         var sourceChipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(20, 0, 20, 12) };
         BindableLayout.SetItemsSource(sourceChipsLayout, _vm.SourceChips);
         BindableLayout.SetItemTemplate(sourceChipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SelectSourceCommand)));
 
-        // 音质 chips（128k/320k/FLAC）
         var qualityLabel = new Label
         {
             Text = "默认音质",
@@ -405,15 +331,9 @@ public class LxOnlineMusicPage : ContentPage
         {
             Spacing = 6,
             Padding = new Thickness(20, 0, 20, 24),
-            Children =
-            {
-                CreateQualityChip("128k"),
-                CreateQualityChip("320k"),
-                CreateQualityChip("FLAC"),
-            },
+            Children = { CreateQualityChip("128k"), CreateQualityChip("320k"), CreateQualityChip("FLAC") },
         };
 
-        // sheet 内容（可滚动，避免高度不够时溢出）
         var sheetContent = new ScrollView
         {
             Content = new VerticalStackLayout
@@ -421,10 +341,31 @@ public class LxOnlineMusicPage : ContentPage
                 Spacing = 0,
                 Children =
                 {
-                    sheetHeader,
+                    new Grid
+                    {
+                        ColumnDefinitions = new ColumnDefinitionCollection
+                        {
+                            new() { Width = GridLength.Star },
+                            new() { Width = GridLength.Auto },
+                        },
+                        Children =
+                        {
+                            new VerticalStackLayout { HorizontalOptions = LayoutOptions.Center, Children = { dragBar } },
+                            closeButton,
+                        },
+                    }.WithChildColumn(closeButton, 1),
                     sheetTitle,
                     sheetStatus,
-                    urlBlock,
+                    new VerticalStackLayout
+                    {
+                        Spacing = 8,
+                        Padding = new Thickness(20, 0, 20, 12),
+                        Children =
+                        {
+                            urlEntry,
+                            new HorizontalStackLayout { Spacing = 8, Children = { importOnlineButton, importLocalButton, clearButton } },
+                        },
+                    },
                     fileLabel,
                     sourceLabel,
                     new ScrollView
@@ -440,7 +381,6 @@ public class LxOnlineMusicPage : ContentPage
         };
         sheet.Content = sheetContent;
 
-        // 遮罩（半透黑），点击关闭 sheet
         var overlay = new BoxView
         {
             Color = Color.FromArgb("#80000000"),
@@ -455,14 +395,24 @@ public class LxOnlineMusicPage : ContentPage
         {
             Children = { overlay, sheet },
         };
-        Grid.SetRowSpan(overlay, 1);
-        // 关键：sheet 未打开时容器必须穿透触摸（否则全屏 Grid 会拦截主页面所有点击，
-        // 齿轮/音源 chips 全部失效）；打开时再接收输入。
+        // 关闭时容器穿透触摸（否则全屏 Grid 拦截主页面所有点击）
         container.SetBinding(VisualElement.InputTransparentProperty,
             new Binding(nameof(LxOnlineMusicViewModel.IsSettingsOpen))
             { Converter = InverseBoolConverter.Instance });
         return container;
     }
+
+    // ── 事件 ──
+
+    /// <summary>点歌播放（整列表入队）</summary>
+    private async void OnSongSelected(object? sender, SelectionChangedEventArgs e)
+    {
+        if (e.CurrentSelection.FirstOrDefault() is not OnlineSong song) return;
+        _songsView.SelectedItem = null;
+        await _vm.PlaySongCommand.ExecuteAsync(song);
+    }
+
+    // ── 小部件 ──
 
     private Border CreateQualityChip(string label)
     {
@@ -475,7 +425,6 @@ public class LxOnlineMusicPage : ContentPage
         chip.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
         var chipLabel = new Label { Text = label, FontSize = 12, FontFamily = "OpenSansSemibold" };
         chipLabel.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
-        // 选中样式（与 SourceChips 类似）
         chipLabel.Triggers.Add(new DataTrigger(typeof(Label))
         {
             Binding = new Binding(nameof(LxOnlineMusicViewModel.QualityText)),
@@ -495,8 +444,6 @@ public class LxOnlineMusicPage : ContentPage
         chip.Content = chipLabel;
         return chip;
     }
-
-    // ── 通用工具 ──
 
     private Border CreateBackButton()
     {
@@ -599,30 +546,7 @@ public class LxOnlineMusicPage : ContentPage
     }
 }
 
-/// <summary>Bool → TranslationY 转换器（sheet 打开/关闭：true→0，false→隐藏值）。</summary>
-internal sealed class SheetOpenToTranslationConverter : IValueConverter
-{
-    public static readonly SheetOpenToTranslationConverter Instance = new();
-    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
-    {
-        var hidden = parameter is double d ? d : 480.0;
-        return value is bool b && b ? 0.0 : hidden;
-    }
-    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
-        => throw new NotSupportedException();
-}
-
-/// <summary>字符串为 null/空 → true（用于能力概览卡空状态显示）。</summary>
-internal sealed class StringNullOrEmptyToBoolConverter : IValueConverter
-{
-    public static readonly StringNullOrEmptyToBoolConverter Instance = new();
-    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
-        => string.IsNullOrEmpty(value as string);
-    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
-        => throw new NotSupportedException();
-}
-
-/// <summary>bool → !bool（用于 InputTransparent 反转：sheet 打开=false 可交互，关闭=true 穿透）。</summary>
+/// <summary>bool → !bool（InputTransparent 反转：sheet 打开=false 可交互，关闭=true 穿透）。</summary>
 internal sealed class InverseBoolConverter : IValueConverter
 {
     public static readonly InverseBoolConverter Instance = new();

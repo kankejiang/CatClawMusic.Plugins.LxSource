@@ -95,11 +95,18 @@ public class LxScriptSources
     /// <summary>key=源短码（wy/kw...），value=该源支持的 action 列表</summary>
     public Dictionary<string, HashSet<string>> ActionsBySource { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>key=源短码，value=该源声明的音质列表（128k/320k/flac/flac24bit），未声明时为空集合</summary>
+    public Dictionary<string, HashSet<string>> QualitysBySource { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>源短码集合</summary>
     public List<string> SourceCodes => ActionsBySource.Keys.ToList();
 
     public bool Supports(string sourceCode, string action) =>
         ActionsBySource.TryGetValue(sourceCode ?? "", out var set) && set.Contains(action);
+
+    /// <summary>取该源声明的音质列表（未声明返回空集合）。</summary>
+    public IReadOnlySet<string> Qualitys(string sourceCode) =>
+        QualitysBySource.TryGetValue(sourceCode ?? "", out var qs) ? qs : new HashSet<string>();
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -124,6 +131,18 @@ public class LxBridge
 
     public string env => "desktop";
     public string version => "2.0.0";
+
+    /// <summary>当前脚本信息（lx 协议字段；脚本头部注释解析暂由宿主外部填充，
+    /// 这里给占位对象避免脚本访问 undefined 抛错，如 currentScriptInfo.version）。</summary>
+    public IDictionary<string, string> currentScriptInfo { get; } = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["name"] = "",
+        ["description"] = "",
+        ["version"] = "",
+        ["author"] = "",
+        ["homepage"] = "",
+        ["rawScript"] = "",
+    };
 
     /// <summary>on(name, handler) 注册的处理器（key=event name, value=JS handler）</summary>
     public Dictionary<string, JsValue> Handlers { get; } = new(StringComparer.Ordinal);
@@ -190,6 +209,7 @@ public class LxBridge
             foreach (var (code, sv) in EnumerateObject(srcObj))
             {
                 var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var qs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 if (sv.IsObject())
                 {
                     var actions = sv.AsObject().Get("actions");
@@ -202,8 +222,20 @@ public class LxBridge
                             if (a.IsString()) set.Add(a.AsString());
                         }
                     }
+                    // qualitys：脚本声明的可解析音质（128k/320k/flac/flac24bit）
+                    var qualitys = sv.AsObject().Get("qualitys");
+                    if (qualitys.IsArray())
+                    {
+                        var qarr = qualitys.AsArray();
+                        for (int i = 0; i < qarr.Length; i++)
+                        {
+                            var q = qarr.Get((uint)i);
+                            if (q.IsString()) qs.Add(q.AsString());
+                        }
+                    }
                 }
                 src.ActionsBySource[code] = set;
+                src.QualitysBySource[code] = qs;
             }
         }
         catch { /* 容错：解析失败按空源处理，调用方会回落 server */ }
@@ -589,6 +621,9 @@ public class LxScriptHost : IDisposable
         catch (Exception ex)
         {
             LastError = "执行脚本失败：" + ex.Message;
+            // JS 异常附带堆栈（定位混淆脚本报错点）
+            if (ex is Jint.Runtime.JavaScriptException jex && !string.IsNullOrWhiteSpace(jex.JavaScriptStackTrace))
+                LastError += "\n" + jex.JavaScriptStackTrace;
             return false;
         }
     }

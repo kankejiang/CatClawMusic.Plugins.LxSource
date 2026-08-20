@@ -155,7 +155,8 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return all;
     }
 
-    /// <summary>获取播放直链（仅脚本 musicUrl action；不支持则 null）</summary>
+    /// <summary>获取播放直链（仅脚本 musicUrl action；不支持则 null）。
+    /// 音质按脚本声明降级 + 失败逐级重试（VIP 歌曲 flac 常取不到，自动降到 320k/128k）。</summary>
     public async Task<string?> GetPlayUrlAsync(OnlineSong song, int quality = 0)
     {
         if (!ScriptReady) return null;
@@ -164,7 +165,31 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         var code = LxPlatformCodes.ToShort(s.Source);
         if (!_script!.Supports(code, "musicUrl")) return null;
         var q = quality > 0 ? quality : _config.QualityLevel;
-        return await _script.GetMusicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, LxQualityFor(q));
+
+        foreach (var level in ResolveQualityOrder(code, q))
+        {
+            var url = await _script.GetMusicUrlAsync(code, s.Id, s.Name, s.Artist, s.IntervalSeconds, level);
+            if (!string.IsNullOrWhiteSpace(url)) return url;
+        }
+        return null;
+    }
+
+    /// <summary>音质尝试顺序：从请求档开始，flac → 320k → 128k 逐级降级，
+    /// 跳过脚本未声明的音质（脚本 qualitys 未声明时返回原始档位）。</summary>
+    private List<string> ResolveQualityOrder(string code, int q)
+    {
+        var want = LxQualityFor(q);
+        var qualitys = _script?.Sources?.Qualitys(code);
+        var all = new[] { "flac", "320k", "128k" };
+        var startIdx = Array.IndexOf(all, want);
+        if (startIdx < 0) startIdx = 0;
+        var order = new List<string>();
+        for (var i = startIdx; i < all.Length; i++)
+        {
+            if (qualitys == null || qualitys.Count == 0 || qualitys.Contains(all[i]))
+                order.Add(all[i]);
+        }
+        return order.Count > 0 ? order : new List<string> { want };
     }
 
     /// <summary>获取歌词（原文 + 译文 + 罗马音三流，仅脚本 lyric action）</summary>

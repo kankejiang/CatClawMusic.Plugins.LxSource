@@ -9,11 +9,13 @@ using Microsoft.Extensions.DependencyInjection;
 namespace CatClawMusic.Plugins.LxSource;
 
 /// <summary>
-/// LX 源音乐页面 ViewModel：脚本导入（在线 URL / 本地文件）、音源选择、音质切换、播放。
-/// <para>设计参考 lx-music-mobile（lyswhut/lx-music-mobile）主页 Main.tsx：
-/// PagerView 多 page + DrawerNav 抽屉切换 nav_search/nav_songlist/nav_top/nav_love/nav_setting。</para>
-/// <para>插件单页面限制下，把"设置入口独立 nav"演化为右上齿轮 → 底部 sheet；
-/// 把"按音源能力渲染不同 view"演化为：根据脚本声明 actions 动态展示能力概览/搜索/歌单占位。</para>
+/// LX 源音乐页面 ViewModel —— 架构照搬 lx-music-mobile（lyswhut/lx-music-mobile）：
+/// 内容数据（搜索/排行榜）直连酷我公开 API（LxKuwoApi），播放直链由用户自定义源
+/// 脚本（musicUrl action）解析。设置入口为右上齿轮 → 底部 sheet。
+/// <para>页面结构（对齐 lx 主页）：</para>
+/// <para>· 搜索框（酷我搜索）</para>
+/// <para>· 榜单横向 chips（热歌榜/飙升榜/新歌榜…，lx kw leaderboard 硬编码榜单）</para>
+/// <para>· 歌曲列表（榜单歌曲或搜索结果；点歌整列表入队播放）</para>
 /// </summary>
 public partial class LxOnlineMusicViewModel : ObservableObject
 {
@@ -45,29 +47,28 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     [ObservableProperty]
     private bool _isSettingsOpen;
 
-    /// <summary>已加载脚本各源能力（用于能力概览卡渲染）。仅含脚本成功 inited 后的源。</summary>
     [ObservableProperty]
-    private ObservableCollection<LxCapabilityItem> _capabilities = new();
+    private string _searchQuery = "";
 
-    /// <summary>能力摘要文本（例：已加载 4 个源 · 4 项能力 / 当前脚本未声明任何源能力）</summary>
+    /// <summary>歌曲列表（榜单歌曲或搜索结果）</summary>
     [ObservableProperty]
-    private string _capabilitySummary = "";
+    private ObservableCollection<OnlineSong> _songs = new();
 
+    /// <summary>榜单 chips（酷我榜单，照搬 lx kw boardList）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxSourceChipItem> _boardChips = new();
+
+    /// <summary>当前选中榜单（null=未选，显示空状态）</summary>
+    [ObservableProperty]
+    private LxSourceChipItem? _selectedBoard;
+
+    /// <summary>当前列表标题（榜单名 / "搜索结果" / 空提示）</summary>
+    [ObservableProperty]
+    private string _listTitle = "";
+
+    /// <summary>音源 chips（自动 + 脚本声明的源；sheet 内使用）</summary>
     [ObservableProperty]
     private ObservableCollection<LxSourceChipItem> _sourceChips = new();
-
-    /// <summary>脚本是否声明 musicSearch（任何源都行）。true 时主页面显示搜索入口。</summary>
-    public bool HasSearchableScript => _plugin.ScriptReady
-        && _plugin.Script?.Sources?.SourceCodes.Any(c => _plugin.Script!.Sources.Supports(c, "musicSearch")) == true;
-
-    /// <summary>脚本是否声明歌单/排行榜类 action（topLists / playLists / getTopLists / getPlayLists 等）。
-    /// 当前主页面未实现卡片网格 UI，仅作为扩展口返回标志位供后续卡片视图判定。</summary>
-    public bool HasCatalogScript => _plugin.ScriptReady
-        && _plugin.Script?.Sources?.SourceCodes.Any(c =>
-            _plugin.Script!.Sources.Supports(c, "topLists")
-            || _plugin.Script!.Sources.Supports(c, "playLists")
-            || _plugin.Script!.Sources.Supports(c, "getTopLists")
-            || _plugin.Script!.Sources.Supports(c, "getPlayLists")) == true;
 
     public LxOnlineMusicViewModel(LxMusicPlugin plugin, IServiceProvider services)
     {
@@ -78,7 +79,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         ScriptFilePath = plugin.Config.ScriptFilePath;
         QualityText = QualityLabel(plugin.Config.QualityLevel);
         RebuildSourceChips();
-        RebuildCapabilities();
+        RebuildBoardChips();
         ScriptStatus = string.IsNullOrEmpty(ScriptUrl) && string.IsNullOrEmpty(ScriptFilePath)
             ? "未导入脚本" : "待加载";
     }
@@ -90,93 +91,103 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         _ => "FLAC",
     };
 
-    /// <summary>根据脚本声明的源重建 chips（自动 + 各声明的源短码映射全名）</summary>
-    public void RebuildSourceChips()
+    // ── 榜单 ──
+
+    /// <summary>榜单 chips：默认选中"热歌榜"并加载</summary>
+    private void RebuildBoardChips()
     {
-        var selected = _plugin.Config.DefaultSource;
-        SourceChips.Clear();
-        SourceChips.Add(new LxSourceChipItem("自动", string.IsNullOrEmpty(selected)));
-        if (_plugin.Script?.Sources != null)
+        var boards = LxKuwoApi.GetBoards();
+        BoardChips.Clear();
+        foreach (var b in boards)
+            BoardChips.Add(new LxSourceChipItem(b.Name, b.Id == "kw__16"));
+        SelectedBoard = BoardChips.FirstOrDefault(c => c.IsSelected);
+    }
+
+    /// <summary>选择榜单 → 加载该榜单歌曲（酷我旧接口，每页 100 首）</summary>
+    [RelayCommand]
+    private async Task SelectBoardAsync(LxSourceChipItem? chip)
+    {
+        if (chip == null) return;
+        foreach (var c in BoardChips) c.IsSelected = ReferenceEquals(c, chip);
+        SelectedBoard = chip;
+        ListTitle = chip.Name;
+        IsBusy = true;
+        try
         {
-            foreach (var code in _plugin.Script.Sources.SourceCodes)
+            var board = LxKuwoApi.GetBoards().FirstOrDefault(b => b.Name == chip.Name);
+            if (board == null) { Songs.Clear(); return; }
+            var songs = await LxKuwoApi.GetBoardSongsAsync(board.BangId);
+            Songs.Clear();
+            if (songs == null)
             {
-                var full = LxPlatformCodes.ToFull(code);
-                if (string.IsNullOrEmpty(full)) full = code;
-                SourceChips.Add(new LxSourceChipItem(full, string.Equals(full, selected, StringComparison.OrdinalIgnoreCase)));
+                ShowTip("榜单加载失败，请检查网络");
+                return;
             }
+            foreach (var s in songs) Songs.Add(s);
+        }
+        finally
+        {
+            IsBusy = false;
         }
     }
 
-    /// <summary>重建能力概览（脚本 inited 后重新填充）。</summary>
-    public void RebuildCapabilities()
+    // ── 搜索 ──
+
+    [RelayCommand]
+    private async Task SearchAsync()
     {
-        Capabilities.Clear();
-        if (!_plugin.ScriptReady || _plugin.Script?.Sources == null)
+        var keyword = (SearchQuery ?? "").Trim();
+        if (keyword.Length == 0) { ShowTip("输入要搜索的歌曲"); return; }
+        ListTitle = $"搜索「{keyword}」";
+        IsBusy = true;
+        try
         {
-            CapabilitySummary = "";
-            return;
+            var songs = await LxKuwoApi.SearchAsync(keyword, 1, 30);
+            Songs.Clear();
+            if (songs == null)
+            {
+                ShowTip("搜索失败，请检查网络");
+                return;
+            }
+            foreach (var s in songs) Songs.Add(s);
+            if (songs.Count == 0) ShowTip("没有找到相关歌曲");
+            // 搜索后清掉榜单选中态（列表语义已变）
+            foreach (var c in BoardChips) c.IsSelected = false;
         }
-        var sources = _plugin.Script.Sources;
-        var allActions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var code in sources.SourceCodes)
-            foreach (var a in sources.ActionsBySource[code])
-                allActions.Add(a);
-        CapabilitySummary = $"已加载 {sources.SourceCodes.Count} 个源 · 声明 {allActions.Count} 项能力";
-        foreach (var code in sources.SourceCodes)
+        finally
         {
-            var name = LxPlatformCodes.ToFull(code);
-            if (string.IsNullOrEmpty(name)) name = code;
-            var actions = sources.ActionsBySource[code]
-                .OrderBy(a => a, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            Capabilities.Add(new LxCapabilityItem(name, actions));
+            IsBusy = false;
         }
     }
 
-    /// <summary>轻提示（自动 3 秒消失）</summary>
-    public void ShowTip(string message)
-    {
-        TipMessage = message;
-        HasTip = true;
-        _tipCts?.Cancel();
-        var cts = _tipCts = new CancellationTokenSource();
-        _ = AutoHideTipAsync(cts.Token);
-    }
+    // ── 播放（榜单/搜索歌曲 → 脚本 musicUrl 取直链 → 宿主队列）──
 
-    private async Task AutoHideTipAsync(CancellationToken ct)
+    [RelayCommand]
+    private async Task PlaySongAsync(OnlineSong? song)
     {
-        try { await Task.Delay(3000, ct); }
-        catch { return; }
-        if (!ct.IsCancellationRequested) HasTip = false;
-    }
-
-    /// <summary>页面出现时同步脚本状态 + 若已加载重建 chips 与能力</summary>
-    public void OnAppearing()
-    {
-        if (_plugin.ScriptReady)
+        if (song == null || Songs.Count == 0) return;
+        if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本（用于解析播放直链）"); return; }
+        try
         {
-            var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
-            ScriptStatus = $"已加载 · {n} 个源";
-            RebuildSourceChips();
-            RebuildCapabilities();
+            var played = await LxPlaybackHelper.PlayListAsync(_services, _plugin, Songs, song);
+            if (played == 0) ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）");
+            else ShowTip($"已入队 {played} 首，开始播放");
         }
-        else if (!string.IsNullOrWhiteSpace(_plugin.Config.ScriptFilePath) || !string.IsNullOrWhiteSpace(_plugin.Config.ScriptUrl))
+        catch (Exception ex)
         {
-            ScriptStatus = "加载中…";
+            ShowTip($"播放失败：{ex.Message}");
         }
     }
 
     // ── 设置 sheet ──
 
-    /// <summary>打开设置 sheet</summary>
     [RelayCommand]
     private void OpenSettings() => IsSettingsOpen = true;
 
-    /// <summary>关闭设置 sheet</summary>
     [RelayCommand]
     private void CloseSettings() => IsSettingsOpen = false;
 
-    // ── 脚本导入 ──
+    // ── 脚本导入（sheet 内）──
 
     /// <summary>在线导入：下载 .js 并执行</summary>
     [RelayCommand]
@@ -189,22 +200,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         { ShowTip("地址需以 http:// 或 https:// 开头"); return; }
         ScriptStatus = "加载中…";
         var ok = await _plugin.LoadScriptAsync(url);
-        if (ok)
-        {
-            _plugin.Config.ScriptUrl = url;
-            _plugin.Config.ScriptFilePath = "";
-            LxConfigStore.Save(_plugin.Config);
-            var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
-            ScriptStatus = $"已加载 · {n} 个源（在线）";
-            RebuildSourceChips();
-            RebuildCapabilities();
-            ShowTip($"脚本加载成功，声明 {n} 个源");
-        }
-        else
-        {
-            ScriptStatus = "加载失败 ✗";
-            ShowTip("脚本加载失败：" + (_plugin.Script?.LastError ?? "未知错误"));
-        }
+        HandleScriptLoaded(ok, "在线");
     }
 
     /// <summary>本地导入（由页面 FilePicker 选文件后调用）</summary>
@@ -213,16 +209,16 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         if (string.IsNullOrWhiteSpace(filePath)) { ShowTip("未选择文件"); return; }
         ScriptStatus = "加载中…";
         var ok = await _plugin.LoadScriptFromFileAsync(filePath);
+        HandleScriptLoaded(ok, "本地");
+    }
+
+    private void HandleScriptLoaded(bool ok, string mode)
+    {
         if (ok)
         {
-            _plugin.Config.ScriptFilePath = filePath;
-            _plugin.Config.ScriptUrl = "";
-            LxConfigStore.Save(_plugin.Config);
-            ScriptFilePath = filePath;
             var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
-            ScriptStatus = $"已加载 · {n} 个源（本地）";
+            ScriptStatus = $"已加载 · {n} 个源（{mode}）";
             RebuildSourceChips();
-            RebuildCapabilities();
             ShowTip($"脚本加载成功，声明 {n} 个源");
         }
         else
@@ -244,14 +240,13 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         _ = _plugin.LoadScriptAsync("");
         ScriptStatus = "未导入脚本";
         RebuildSourceChips();
-        RebuildCapabilities();
         ShowTip("已清除脚本");
         return Task.CompletedTask;
     }
 
-    // ── 音质与音源 ──
+    // ── 音质与音源（sheet 内）──
 
-    /// <summary>循环切换音质（128k → 320k → FLAC），立即持久化</summary>
+    /// <summary>循环切换音质（128k → 320k → FLAC）</summary>
     [RelayCommand]
     private void CycleQuality()
     {
@@ -261,7 +256,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         ShowTip($"音质已切换：{QualityText}");
     }
 
-    /// <summary>设置指定音质档（0=128k 1=320k 2=FLAC），立即持久化。供底部 sheet 直接点选使用。</summary>
+    /// <summary>设置指定音质档（0=128k 1=320k 2=FLAC）</summary>
     [RelayCommand]
     private void SetQuality(string? label)
     {
@@ -278,7 +273,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         ShowTip($"音质已切换：{QualityText}");
     }
 
-    /// <summary>选择音源（立即持久化）</summary>
+    /// <summary>选择音源（脚本解析播放直链时优先用的源）</summary>
     [RelayCommand]
     private void SelectSource(LxSourceChipItem chip)
     {
@@ -288,24 +283,54 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         ShowTip($"音源已切换：{chip.Name}");
     }
 
-    // ── 播放（保留：未来搜索结果卡选中播放 / 歌单详情点歌）──
+    // ── 通用 ──
 
-    [RelayCommand]
-    private async Task PlaySongAsync(OnlineSong? song)
+    /// <summary>根据脚本声明的源重建 chips（自动 + 各声明的源短码映射全名）</summary>
+    public void RebuildSourceChips()
     {
-        if (song == null) return;
-        if (!_plugin.ScriptReady) { ShowTip("请先导入脚本"); return; }
-        try
+        var selected = _plugin.Config.DefaultSource;
+        SourceChips.Clear();
+        SourceChips.Add(new LxSourceChipItem("自动", string.IsNullOrEmpty(selected)));
+        if (_plugin.Script?.Sources != null)
         {
-            // 单首也走 LxPlaybackHelper（构造单元素队列并调脚本取播放直链）；
-            // 未来搜索/歌单列表填满 Songs 时，调用方改为传入 Songs 即可走整列表。
-            var played = await LxPlaybackHelper.PlayListAsync(_services, _plugin, new[] { song }, song);
-            if (played == 0) ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）");
+            foreach (var code in _plugin.Script.Sources.SourceCodes)
+            {
+                var full = LxPlatformCodes.ToFull(code);
+                if (string.IsNullOrEmpty(full)) full = code;
+                SourceChips.Add(new LxSourceChipItem(full, string.Equals(full, selected, StringComparison.OrdinalIgnoreCase)));
+            }
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>轻提示（自动 3 秒消失）</summary>
+    public void ShowTip(string message)
+    {
+        TipMessage = message;
+        HasTip = true;
+        _tipCts?.Cancel();
+        var cts = _tipCts = new CancellationTokenSource();
+        _ = AutoHideTipAsync(cts.Token);
+    }
+
+    private async Task AutoHideTipAsync(CancellationToken ct)
+    {
+        try { await Task.Delay(3000, ct); }
+        catch { return; }
+        if (!ct.IsCancellationRequested) HasTip = false;
+    }
+
+    /// <summary>页面出现时：同步脚本状态 + 首次进入自动加载默认榜单</summary>
+    public void OnAppearing()
+    {
+        if (_plugin.ScriptReady)
         {
-            ShowTip($"播放失败：{ex.Message}");
+            var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
+            ScriptStatus = $"已加载 · {n} 个源";
+            RebuildSourceChips();
         }
+        // 首次进入且列表为空 → 加载默认榜单（热歌榜）
+        if (Songs.Count == 0 && SelectedBoard != null && string.IsNullOrEmpty(ListTitle))
+            _ = SelectBoardAsync(SelectedBoard);
     }
 }
 
@@ -328,17 +353,30 @@ public static class LxPlaybackHelper
         CoverArtPath = os.CoverUrl,
     };
 
-    /// <summary>取每首的播放直链并加入播放队列（RemoteId 路由由宿主歌词兜底链识别 lx: 源）。返回成功入队的数量。</summary>
+    /// <summary>预取被点歌曲 + 后续最多 4 首的播放直链并入队播放。
+    /// 注意：绝不对整列表（榜单 100 首）串行调脚本取直链——每首一次脚本调用
+    /// （内含 HTTP 请求，失败时可达 15s），整列表会卡死数分钟。
+    /// 整体 20s 超时兜底，失败歌曲跳过。</summary>
     public static async Task<int> PlayListAsync(IServiceProvider services, LxMusicPlugin plugin,
         IReadOnlyList<OnlineSong> songs, OnlineSong start)
     {
         var queue = services.GetRequiredService<PlayQueue>();
         var player = services.GetRequiredService<IAudioPlayerService>();
+
+        // 从被点那首开始预取 5 首（被点歌优先；其余作为队列连播候选）
+        var list = songs as IList<OnlineSong> ?? songs.ToList();
+        var startIdx = list.IndexOf(start);
+        if (startIdx < 0) startIdx = 0;
+        var subset = list.Skip(startIdx).Take(5).ToList();
+
         var temp = new List<Song>();
-        foreach (var s in songs)
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        foreach (var s in subset)
         {
+            if (cts.IsCancellationRequested) break;
             string? url = null;
-            try { url = await plugin.GetPlayUrlAsync(s, plugin.Config.QualityLevel); } catch { }
+            try { url = await plugin.GetPlayUrlAsync(s, plugin.Config.QualityLevel).WaitAsync(cts.Token); }
+            catch { }
             if (string.IsNullOrWhiteSpace(url)) continue;
             temp.Add(ToQueueSong(s, url));
         }
@@ -351,20 +389,7 @@ public static class LxPlaybackHelper
     }
 }
 
-/// <summary>音源能力项：name=源全名（网易云/QQ/...），actions=该源声明的 actions 列表。</summary>
-public class LxCapabilityItem
-{
-    public string Name { get; }
-    public IReadOnlyList<string> Actions { get; }
-
-    public LxCapabilityItem(string name, IReadOnlyList<string> actions)
-    {
-        Name = name;
-        Actions = actions;
-    }
-}
-
-/// <summary>音源 chip 项</summary>
+/// <summary>音源/榜单 chip 项</summary>
 public partial class LxSourceChipItem : ObservableObject
 {
     public string Name { get; }
