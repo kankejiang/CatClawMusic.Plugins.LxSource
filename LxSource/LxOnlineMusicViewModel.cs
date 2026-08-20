@@ -197,18 +197,24 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         }
     }
 
-    // ── 播放（榜单/搜索歌曲 → 脚本 musicUrl 取直链 → 宿主队列）──
+    // ── 播放（点击/菜单播放：只取被点那一首的直链，单首入队播放）──
 
     [RelayCommand]
     private async Task PlaySongAsync(OnlineSong? song)
     {
-        if (song == null || Songs.Count == 0) return;
+        if (song == null) return;
         if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本（用于解析播放直链）"); return; }
         try
         {
-            var played = await LxPlaybackHelper.PlayListAsync(_services, _plugin, Songs, song);
-            if (played == 0) ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）");
-            else ShowTip($"已入队 {played} 首，开始播放");
+            var url = await _plugin.GetPlayUrlAsync(song, _plugin.Config.QualityLevel);
+            if (string.IsNullOrWhiteSpace(url)) { ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）"); return; }
+            var queue = _services.GetRequiredService<PlayQueue>();
+            var player = _services.GetRequiredService<IAudioPlayerService>();
+            var qSong = LxPlaybackHelper.ToQueueSong(song, url);
+            queue.SetSongs(new List<Song> { qSong });
+            queue.SelectSong(qSong.Id);
+            await player.PlayAsync(qSong.FilePath);
+            ShowTip($"正在播放：{song.Title}");
         }
         catch (Exception ex)
         {
@@ -477,7 +483,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     }
 }
 
-/// <summary>播放队列构造辅助（脚本取播放直链 → 临时负 Id + RemoteId 路由入队）</summary>
+/// <summary>播放队列构造辅助（脚本取播放直链 → 临时负 Id + RemoteId 路由入队）。</summary>
 public static class LxPlaybackHelper
 {
     private static int _idSeq;
@@ -495,41 +501,6 @@ public static class LxPlaybackHelper
         AllArtists = os.Artist,
         CoverArtPath = os.CoverUrl,
     };
-
-    /// <summary>预取被点歌曲 + 后续最多 4 首的播放直链并入队播放。
-    /// 注意：绝不对整列表（榜单 100 首）串行调脚本取直链——每首一次脚本调用
-    /// （内含 HTTP 请求，失败时可达 15s），整列表会卡死数分钟。
-    /// 整体 20s 超时兜底，失败歌曲跳过。</summary>
-    public static async Task<int> PlayListAsync(IServiceProvider services, LxMusicPlugin plugin,
-        IReadOnlyList<OnlineSong> songs, OnlineSong start)
-    {
-        var queue = services.GetRequiredService<PlayQueue>();
-        var player = services.GetRequiredService<IAudioPlayerService>();
-
-        // 从被点那首开始预取 5 首（被点歌优先；其余作为队列连播候选）
-        var list = songs as IList<OnlineSong> ?? songs.ToList();
-        var startIdx = list.IndexOf(start);
-        if (startIdx < 0) startIdx = 0;
-        var subset = list.Skip(startIdx).Take(5).ToList();
-
-        var temp = new List<Song>();
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        foreach (var s in subset)
-        {
-            if (cts.IsCancellationRequested) break;
-            string? url = null;
-            try { url = await plugin.GetPlayUrlAsync(s, plugin.Config.QualityLevel).WaitAsync(cts.Token); }
-            catch { }
-            if (string.IsNullOrWhiteSpace(url)) continue;
-            temp.Add(ToQueueSong(s, url));
-        }
-        if (temp.Count == 0) return 0;
-        queue.SetSongs(temp);
-        var target = temp.FirstOrDefault(s => s.RemoteId == $"{start.Platform}:{start.Id}") ?? temp[0];
-        queue.SelectSong(target.Id);
-        try { await player.PlayAsync(target.FilePath); } catch { }
-        return temp.Count;
-    }
 }
 
 /// <summary>音源/榜单 chip 项</summary>
