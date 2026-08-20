@@ -133,6 +133,8 @@ public class LxOnlineMusicPage : ContentPage
         // 长按 → 歌曲操作菜单（命令源为 VM，参数为歌曲项）
         _songsView.ItemTemplate = new DataTemplate(() =>
             LxUiKit.CreateSongItemTemplate(_vm.OpenSongMenuCommand));
+        // 列表滚动即取消所有长按计时（滚动误触兜底：滚动必然触发 Scrolled）
+        _songsView.Scrolled += (_, _) => LxUiKit.CancelAllLongPresses();
         _songsView.SelectionChanged += OnSongSelected;
 
         // ── loading / tip ──
@@ -370,6 +372,15 @@ public class LxOnlineMusicPage : ContentPage
                         },
                     },
                     fileLabel,
+                    // 音源开关：脚本声明的各源可单独启用/禁用
+                    new Label
+                    {
+                        Text = "音源开关（点击启用/禁用）",
+                        FontSize = 12,
+                        FontFamily = "OpenSansSemibold",
+                        Margin = new Thickness(20, 4, 20, 4),
+                    }.WithDynamicResource(Label.TextColorProperty, "TextSecondaryColor"),
+                    BuildSourceToggleRow(),
                     sourceLabel,
                     new ScrollView
                     {
@@ -403,6 +414,21 @@ public class LxOnlineMusicPage : ContentPage
             new Binding(nameof(LxOnlineMusicViewModel.IsSettingsOpen))
             { Converter = InverseBoolConverter.Instance });
         return container;
+    }
+
+    // ── 设置 sheet 内的源开关行（每源一个可切换 chip）──
+
+    private ScrollView BuildSourceToggleRow()
+    {
+        var chipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(20, 0, 20, 12) };
+        BindableLayout.SetItemsSource(chipsLayout, _vm.SourceToggleChips);
+        BindableLayout.SetItemTemplate(chipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.ToggleSourceCommand)));
+        return new ScrollView
+        {
+            Orientation = ScrollOrientation.Horizontal,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Never,
+            Content = chipsLayout,
+        };
     }
 
     // ── 歌曲操作覆盖层：长按菜单 sheet + 下载音质选择弹窗 ──
@@ -757,13 +783,19 @@ internal sealed class NonEmptyPrefixConverter : IValueConverter
         => throw new NotSupportedException();
 }
 
-/// <summary>小工具：链式设置 Grid 列/行</summary>
+/// <summary>小工具：链式设置 Grid 列/行 / 动态资源</summary>
 internal static class PageGridExtensions
 {
     public static Grid WithChildColumn(this Grid grid, View child, int column)
     {
         Grid.SetColumn(child, column);
         return grid;
+    }
+
+    public static T WithDynamicResource<T>(this T element, BindableProperty property, string key) where T : Element
+    {
+        element.SetDynamicResource(property, key);
+        return element;
     }
 
     public static T GridRow<T>(this T view, int row) where T : BindableObject

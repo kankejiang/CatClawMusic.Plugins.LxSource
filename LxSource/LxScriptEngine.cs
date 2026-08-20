@@ -529,6 +529,9 @@ public class LxScriptHost : IDisposable
 {
     private static readonly HttpClient FetchHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
 
+    /// <summary>串行化引擎创建/赋值（防止并发加载时 _engine 被覆盖/置空）</summary>
+    private readonly object _scriptLock = new();
+
     private Engine? _engine;
     private LxBridge? _bridge;
 
@@ -593,29 +596,37 @@ public class LxScriptHost : IDisposable
         }
     }
 
-    /// <summary>执行脚本代码（async：脚本用 async IIFE 初始化时需 drain 微任务）。</summary>
+    /// <summary>执行脚本代码（async：脚本用 async IIFE 初始化时需 drain 微任务）。
+    /// 并发安全：引擎创建/赋值在锁内，执行用局部引用（await 期间不受 Unload 并发置空影响）。</summary>
     public async Task<bool> RunAsync(string code)
     {
-        try
+        Engine engine;
+        LxBridge bridge;
+        lock (_scriptLock)
         {
-            _engine = new Engine(opts => opts
+            engine = new Engine(opts => opts
                 .LimitRecursion(5000)
                 .TimeoutInterval(TimeSpan.FromSeconds(8)));
-            _bridge = new LxBridge(_engine);
-            _engine.Global["lx"] = JsValue.FromObject(_engine, _bridge);
+            bridge = new LxBridge(engine);
+            _engine = engine;
+            _bridge = bridge;
+            engine.Global["lx"] = JsValue.FromObject(engine, bridge);
             // 提供 no-op console（脚本常用 console.log 调试，Jint 默认无 console）
-            _engine.Execute("var console={log:function(){},error:function(){},warn:function(){},info:function(){},debug:function(){},trace:function(){}}");
+            engine.Execute("var console={log:function(){},error:function(){},warn:function(){},info:function(){},debug:function(){},trace:function(){}}");
+        }
+        try
+        {
             // ExecuteAsync 会 await 脚本里 pending 的 Promise/async IIFE（如 checkUpdate 后 send inited）
-            await _engine.ExecuteAsync(code);
-            if (_bridge.Inited && _bridge.Sources != null && _bridge.Sources.SourceCodes.Count > 0)
+            await engine.ExecuteAsync(code);
+            if (bridge.Inited && bridge.Sources != null && bridge.Sources.SourceCodes.Count > 0)
                 return true;
             // 脚本发了 updateAlert 但未 inited（检测到新版，拒绝运行旧版）
-            if (_bridge.HasUpdateAlert)
+            if (bridge.HasUpdateAlert)
             {
-                LastError = _bridge.UpdateMessage ?? "脚本有新版本";
+                LastError = bridge.UpdateMessage ?? "脚本有新版本";
                 return false;
             }
-            LastError = _bridge!.Inited ? "脚本未声明任何源" : "脚本未调用 send(inited, ...)";
+            LastError = bridge.Inited ? "脚本未声明任何源" : "脚本未调用 send(inited, ...)";
             return false;
         }
         catch (Exception ex)

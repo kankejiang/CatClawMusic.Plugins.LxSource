@@ -16,6 +16,9 @@ public class LxConfig
 
     /// <summary>默认音源标识（空 = 自动，用脚本声明的第一个源；如 netease/qq/kuwo/kugou/migu）</summary>
     public string DefaultSource { get; set; } = "";
+
+    /// <summary>禁用的源短码列表（脚本声明多源时单独启用/关闭；如 ["kg"]）</summary>
+    public List<string> DisabledSources { get; set; } = new();
 }
 
 /// <summary>配置读写：{LocalApplicationData}/CatClawMusic.Maui/lx_source_config.json</summary>

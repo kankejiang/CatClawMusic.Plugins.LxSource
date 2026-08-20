@@ -155,7 +155,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return all;
     }
 
-    /// <summary>获取播放直链（仅脚本 musicUrl action；不支持则 null）。
+    /// <summary>获取播放直链（仅脚本 musicUrl action；不支持或被禁用则 null）。
     /// quality 语义：>=0 直接用（0=128k 1=320k 2=FLAC）；负数使用配置档位。
     /// 音质按脚本声明降级 + 失败逐级重试（VIP 歌曲 flac 常取不到，自动降到 320k/128k）。</summary>
     public async Task<string?> GetPlayUrlAsync(OnlineSong song, int quality = -1)
@@ -164,6 +164,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         var s = ToLxSong(song);
         if (s == null || string.IsNullOrWhiteSpace(s.Source)) return null;
         var code = LxPlatformCodes.ToShort(s.Source);
+        if (!IsSourceEnabled(code)) return null;
         if (!_script!.Supports(code, "musicUrl")) return null;
         var q = quality >= 0 ? quality : _config.QualityLevel;
 
@@ -173,6 +174,22 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
             if (!string.IsNullOrWhiteSpace(url)) return url;
         }
         return null;
+    }
+
+    // ── 源启停（脚本声明多源时单独启用/关闭）──
+
+    /// <summary>源是否启用（未在 DisabledSources 中视为启用）。code 为短码（kw/kg/tx/wy/mg）。</summary>
+    public bool IsSourceEnabled(string code) =>
+        !string.IsNullOrEmpty(code) && !_config.DisabledSources.Contains(code, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>设置源启用/禁用（立即持久化）。</summary>
+    public void SetSourceEnabled(string code, bool enabled)
+    {
+        if (string.IsNullOrEmpty(code)) return;
+        var list = _config.DisabledSources;
+        if (enabled) list.RemoveAll(x => x.Equals(code, StringComparison.OrdinalIgnoreCase));
+        else if (!list.Contains(code, StringComparer.OrdinalIgnoreCase)) list.Add(code);
+        LxConfigStore.Save(_config);
     }
 
     /// <summary>音质尝试顺序：从请求档开始，flac → 320k → 128k 逐级降级，

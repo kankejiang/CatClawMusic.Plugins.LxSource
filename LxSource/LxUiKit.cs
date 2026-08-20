@@ -22,8 +22,8 @@ public static class LxUiKit
         return Color.FromArgb("#7B68EE");
     }
 
-    /// <summary>歌曲行：封面 40 + 标题/艺术家 + 时长右对齐（点击由 CollectionView SelectionChanged 处理）。
-    /// longPressCommand 非空时附加长按手势（PointerGestureRecognizer + 500ms 计时；命令参数为歌曲项本身）。</summary>
+    /// <summary>长按歌曲 → 歌曲操作菜单（PointerGestureRecognizer + 500ms 计时；MAUI 无内置 LongPress）。
+    /// 按下后移动超阈值（滚动/拖拽）或列表滚动（Scrolled）均取消计时。</summary>
     public static View CreateSongItemTemplate(ICommand? longPressCommand = null)
     {
         var coverBorder = new Border
@@ -79,16 +79,20 @@ public static class LxUiKit
             var pointer = new PointerGestureRecognizer();
             var cts = new CancellationTokenSource();
             Point? pressedPos = null;
-            const double moveThreshold = 20;  // 移动超过该像素视为滚动/拖拽，取消长按
+            const double moveThreshold = 12;  // 移动超过该像素视为滚动/拖拽，取消长按
             pointer.PointerPressed += (_, e) =>
             {
                 cts.Cancel();
+                RemoveActivePress(cts);
                 cts = new CancellationTokenSource();
-                pressedPos = e.GetPosition(root);
+                AddActivePress(cts);
+                // 屏幕坐标兜底（元素未附加时 GetPosition(root) 可能返回 null）
+                pressedPos = e.GetPosition(root) ?? e.GetPosition(null);
                 var ct = cts.Token;
                 _ = Task.Delay(500, ct).ContinueWith(_ =>
                 {
                     if (ct.IsCancellationRequested) return;
+                    RemoveActivePress(cts);
                     MainThread.BeginInvokeOnMainThread(() =>
                     {
                         if (longPressCommand.CanExecute(root.BindingContext))
@@ -96,19 +100,38 @@ public static class LxUiKit
                     });
                 }, ct);
             };
-            // 拖动/滚动时手指会移动 → 超过阈值取消长按计时（否则滚动列表误触菜单）
+            // 拖动/滚动时手指移动 → 超阈值取消计时
             pointer.PointerMoved += (_, e) =>
             {
                 if (cts.IsCancellationRequested || pressedPos is not { } p0) return;
-                var p1 = e.GetPosition(root);
+                var p1 = e.GetPosition(root) ?? e.GetPosition(null);
                 if (p1 is not { } p) return;
                 if (Math.Abs(p.X - p0.X) > moveThreshold || Math.Abs(p.Y - p0.Y) > moveThreshold)
                     cts.Cancel();
             };
-            pointer.PointerReleased += (_, _) => cts.Cancel();
+            pointer.PointerReleased += (_, _) =>
+            {
+                cts.Cancel();
+                RemoveActivePress(cts);
+            };
             root.GestureRecognizers.Add(pointer);
         }
         return root;
+    }
+
+    // ── 长按计时注册表：列表滚动（Scrolled）时统一取消，防止滚动误触发 ──
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<CancellationTokenSource, byte> ActivePresses = new();
+
+    private static void AddActivePress(CancellationTokenSource cts) => ActivePresses[cts] = 0;
+
+    private static void RemoveActivePress(CancellationTokenSource cts) => ActivePresses.TryRemove(cts, out _);
+
+    /// <summary>取消所有正在计时的长按（由列表 Scrolled 事件调用，滚动即视为非长按）。</summary>
+    public static void CancelAllLongPresses()
+    {
+        foreach (var cts in ActivePresses.Keys) cts.Cancel();
+        ActivePresses.Clear();
     }
 
     /// <summary>音源 chip 模板（Tap 命令绑定到指定源，参数为 chip 项本身）</summary>

@@ -79,6 +79,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         ScriptFilePath = plugin.Config.ScriptFilePath;
         QualityText = QualityLabel(plugin.Config.QualityLevel);
         RebuildSourceChips();
+        RebuildSourceToggles();
         RebuildBoardChips();
         ScriptStatus = string.IsNullOrEmpty(ScriptUrl) && string.IsNullOrEmpty(ScriptFilePath)
             ? "未导入脚本" : "待加载";
@@ -368,6 +369,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
             var n = _plugin.Script?.Sources?.SourceCodes.Count ?? 0;
             ScriptStatus = $"已加载 · {n} 个源（{mode}）";
             RebuildSourceChips();
+            RebuildSourceToggles();
             ShowTip($"脚本加载成功，声明 {n} 个源");
         }
         else
@@ -434,7 +436,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
 
     // ── 通用 ──
 
-    /// <summary>根据脚本声明的源重建 chips（自动 + 各声明的源短码映射全名）</summary>
+    /// <summary>根据脚本声明的源重建 chips（自动 + 各声明的源短码映射全名；禁用源过滤）</summary>
     public void RebuildSourceChips()
     {
         var selected = _plugin.Config.DefaultSource;
@@ -444,11 +446,45 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         {
             foreach (var code in _plugin.Script.Sources.SourceCodes)
             {
+                if (!_plugin.IsSourceEnabled(code)) continue;  // 已禁用的源不进入默认源选择
                 var full = LxPlatformCodes.ToFull(code);
                 if (string.IsNullOrEmpty(full)) full = code;
                 SourceChips.Add(new LxSourceChipItem(full, string.Equals(full, selected, StringComparison.OrdinalIgnoreCase)));
             }
         }
+    }
+
+    // ── 源启停（设置 sheet 内：每源一个开关 chip，IsSelected=启用）──
+
+    /// <summary>源开关 chips（Name=源全名，IsSelected=启用）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxSourceChipItem> _sourceToggleChips = new();
+
+    /// <summary>重建源开关 chips（脚本声明的全部源，禁用源显示为未选中）</summary>
+    public void RebuildSourceToggles()
+    {
+        SourceToggleChips.Clear();
+        if (_plugin.Script?.Sources == null) return;
+        foreach (var code in _plugin.Script.Sources.SourceCodes)
+        {
+            var full = LxPlatformCodes.ToFull(code);
+            if (string.IsNullOrEmpty(full)) full = code;
+            SourceToggleChips.Add(new LxSourceChipItem(full, _plugin.IsSourceEnabled(code)));
+        }
+    }
+
+    /// <summary>切换源启用/禁用（持久化）</summary>
+    [RelayCommand]
+    private void ToggleSource(LxSourceChipItem chip)
+    {
+        var full = chip.Name;
+        var code = LxPlatformCodes.ToShort(full);
+        if (string.IsNullOrEmpty(code)) return;
+        var enable = !chip.IsSelected;
+        chip.IsSelected = enable;
+        _plugin.SetSourceEnabled(code, enable);
+        RebuildSourceChips();
+        ShowTip(enable ? $"已启用音源：{chip.Name}" : $"已禁用音源：{chip.Name}");
     }
 
     /// <summary>轻提示（自动 3 秒消失）</summary>
