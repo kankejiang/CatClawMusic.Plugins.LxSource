@@ -430,9 +430,12 @@ public partial class LxOnlineMusicViewModel : ObservableObject
             IsBusy = false;
         }
         if (songs == null) { ShowTip("歌单加载失败，请检查网络"); return; }
-        var page = new LxPlaylistDetailPage(playlist, songs, _services, this);
+        // 上方 GetPlaylistSongsAsync 用了 ConfigureAwait(false)，续体落在线程池线程；
+        // MAUI Page 构造 + 导航必须占用 UI 线程，否则 Android 跨线程创建控件闪退。
         try
         {
+            var page = await MainThread.InvokeOnMainThreadAsync(() =>
+                new LxPlaylistDetailPage(playlist, songs!, _services, this));
             if (Shell.Current?.Navigation is { } nav) await nav.PushAsync(page);
         }
         catch { }

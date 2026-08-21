@@ -205,5 +205,10 @@ internal sealed class LxPlaylistDetailViewModel
 internal static class LxDetailCoverConverter
 {
     public static ImageSource ToSource(string? url)
-        => string.IsNullOrWhiteSpace(url) ? "ic_music_note" : ImageSource.FromUri(new Uri(url));
+    {
+        if (string.IsNullOrWhiteSpace(url)) return "ic_music_note";
+        // 非法/相对 URL 时回落到占位图标，避免详情页构造抛异常（该构造不在调用方 try 内）
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || !uri.IsAbsoluteUri) return "ic_music_note";
+        return ImageSource.FromUri(uri);
+    }
 }
