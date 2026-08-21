@@ -88,7 +88,7 @@ public class LxApiClient
             var data = EnvelopeData(doc);
             if (data == null || !data.Value.TryGetProperty("list", out var list) || list.ValueKind != JsonValueKind.Array)
                 return null;
-            var songs = new List<LxSong>();
+            var songs = new List<LxSong>(Math.Clamp(pageSize, 1, 100));
             foreach (var item in list.EnumerateArray())
                 songs.Add(ParseSong(item));
             return songs;

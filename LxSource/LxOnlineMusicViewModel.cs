@@ -5,6 +5,7 @@ using CatClawMusic.Core.Services;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Maui.Controls;
 
 namespace CatClawMusic.Plugins.LxSource;
 
@@ -66,6 +67,54 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     [ObservableProperty]
     private string _listTitle = "";
 
+    // ── UI Tab 状态（搜索 / 歌单 / 排行榜）──
+
+    /// <summary>当前主 Tab（搜索 / 歌单 / 排行榜）</summary>
+    [ObservableProperty]
+    private LxUiTab _currentTab = LxUiTab.Search;
+
+    /// <summary>搜索页子 Tab（歌曲 / 歌单）</summary>
+    [ObservableProperty]
+    private LxSearchTab _currentSearchTab = LxSearchTab.Song;
+
+    /// <summary>歌单页排序（最热 / 最新）</summary>
+    [ObservableProperty]
+    private LxPlaylistSort _playlistSort = LxPlaylistSort.Hot;
+
+    /// <summary>主 Tab chips（搜索 / 歌单 / 排行榜）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxSourceChipItem> _mainTabs = new();
+
+    /// <summary>搜索子 Tab chips（歌曲 / 歌单）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxSourceChipItem> _searchTabs = new();
+
+    /// <summary>歌单排序 chips（最热 / 最新）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxSourceChipItem> _playlistSortChips = new();
+
+    /// <summary>歌单分类 chips（全部 + 各标签）</summary>
+    [ObservableProperty]
+    private ObservableCollection<LxCategoryChip> _playlistCategories = new();
+
+    /// <summary>当前选中歌单分类（null=全部）</summary>
+    [ObservableProperty]
+    private LxCategoryChip? _selectedCategory;
+
+    /// <summary>歌单列表（歌单 Tab：最热/最新 + 分类）</summary>
+    [ObservableProperty]
+    private ObservableCollection<OnlinePlaylist> _playlists = new();
+
+    /// <summary>歌单搜索结果（搜索页「歌单」子 Tab）</summary>
+    [ObservableProperty]
+    private ObservableCollection<OnlinePlaylist> _searchPlaylistResults = new();
+
+    /// <summary>排行榜列表（排行榜 Tab：酷我 25 榜单）</summary>
+    [ObservableProperty]
+    private ObservableCollection<OnlinePlaylist> _toplists = new();
+
+    private bool _tabDataLoaded;
+
     /// <summary>音源 chips（自动 + 脚本声明的源；sheet 内使用）</summary>
     [ObservableProperty]
     private ObservableCollection<LxSourceChipItem> _sourceChips = new();
@@ -83,6 +132,15 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         RebuildBoardChips();
         ScriptStatus = string.IsNullOrEmpty(ScriptUrl) && string.IsNullOrEmpty(ScriptFilePath)
             ? "未导入脚本" : "待加载";
+
+        // ── UI Tab chips ──
+        MainTabs.Add(new LxSourceChipItem("搜索", true));
+        MainTabs.Add(new LxSourceChipItem("歌单", false));
+        MainTabs.Add(new LxSourceChipItem("排行榜", false));
+        SearchTabs.Add(new LxSourceChipItem("歌曲", true));
+        SearchTabs.Add(new LxSourceChipItem("歌单", false));
+        PlaylistSortChips.Add(new LxSourceChipItem("最热", true));
+        PlaylistSortChips.Add(new LxSourceChipItem("最新", false));
     }
 
     private static string QualityLabel(int q) => q switch
@@ -174,7 +232,18 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     private async Task SearchAsync()
     {
         var keyword = (SearchQuery ?? "").Trim();
-        if (keyword.Length == 0) { ShowTip("输入要搜索的歌曲"); return; }
+        if (keyword.Length == 0) { ShowTip("输入要搜索的歌曲或歌单"); return; }
+        // 搜索页「歌单」子 Tab → 走歌单搜索；「歌曲」子 Tab → 走歌曲搜索
+        if (CurrentSearchTab == LxSearchTab.Playlist)
+        {
+            await SearchPlaylistAsync(keyword);
+            return;
+        }
+        await SearchSongsAsync(keyword);
+    }
+
+    private async Task SearchSongsAsync(string keyword)
+    {
         ListTitle = $"搜索「{keyword}」";
         IsBusy = true;
         try
@@ -198,7 +267,209 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         }
     }
 
+    private async Task SearchPlaylistAsync(string keyword)
+    {
+        ListTitle = $"搜索「{keyword}」· 歌单";
+        IsBusy = true;
+        try
+        {
+            var pls = await _plugin.SearchPlaylistsAsync(keyword, 1, 30);
+            SearchPlaylistResults.Clear();
+            if (pls == null)
+            {
+                ShowTip("歌单搜索失败，请检查网络");
+                return;
+            }
+            foreach (var p in pls) SearchPlaylistResults.Add(p);
+            if (pls.Count == 0) ShowTip("没有找到相关歌单");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    // ── UI Tab 切换 ──
+
+    /// <summary>切换主 Tab（搜索 / 歌单 / 排行榜）。参数 = tab chip。</summary>
+    [RelayCommand]
+    private void SwitchMainTab(LxSourceChipItem? chip)
+    {
+        if (chip == null) return;
+        foreach (var c in MainTabs) c.IsSelected = ReferenceEquals(c, chip);
+        var tab = chip.Name switch
+        {
+            "歌单" => LxUiTab.Playlist,
+            "排行榜" => LxUiTab.Ranking,
+            _ => LxUiTab.Search,
+        };
+        CurrentTab = tab;
+        if (tab == LxUiTab.Playlist || tab == LxUiTab.Ranking)
+            _ = EnsureTabDataAsync();
+    }
+
+    /// <summary>切换搜索页子 Tab（歌曲 / 歌单）。</summary>
+    [RelayCommand]
+    private void SwitchSearchTab(LxSourceChipItem? chip)
+    {
+        if (chip == null) return;
+        foreach (var c in SearchTabs) c.IsSelected = ReferenceEquals(c, chip);
+        CurrentSearchTab = chip.Name switch { "歌单" => LxSearchTab.Playlist, _ => LxSearchTab.Song };
+        // 已有非空关键词 → 按当前子 Tab 重新搜索
+        if (!string.IsNullOrWhiteSpace(SearchQuery))
+            _ = SearchAsync();
+    }
+
+    /// <summary>切换歌单页排序（最热 / 最新）。</summary>
+    [RelayCommand]
+    private void SwitchPlaylistSort(LxSourceChipItem? chip)
+    {
+        if (chip == null) return;
+        foreach (var c in PlaylistSortChips) c.IsSelected = ReferenceEquals(c, chip);
+        PlaylistSort = chip.Name switch { "最新" => LxPlaylistSort.New, _ => LxPlaylistSort.Hot };
+        _ = LoadPlaylistsAsync();
+    }
+
+    /// <summary>选择歌单分类（全部 / 某标签）。</summary>
+    [RelayCommand]
+    private void SelectPlaylistCategory(LxCategoryChip? chip)
+    {
+        if (chip == null) return;
+        foreach (var c in PlaylistCategories) c.IsSelected = ReferenceEquals(c, chip);
+        SelectedCategory = chip;
+        _ = LoadPlaylistsAsync();
+    }
+
+    /// <summary>歌单/排行榜 Tab 首次进入时懒加载分类 + 歌单列表 + 排行榜（只做一次）。</summary>
+    private async Task EnsureTabDataAsync()
+    {
+        if (_tabDataLoaded) return;
+        _tabDataLoaded = true;
+        try
+        {
+            var catsTask = LoadPlaylistCategoriesAsync();
+            var plTask = LoadPlaylistsAsync();
+            var topTask = LoadToplistsAsync();
+            await Task.WhenAll(catsTask, plTask, topTask).ConfigureAwait(false);
+        }
+        catch { }
+    }
+
+    /// <summary>加载歌单分类（全部 + 各标签），失败保留「全部」。</summary>
+    private async Task LoadPlaylistCategoriesAsync()
+    {
+        try
+        {
+            var groups = await LxKuwoApi.GetPlaylistCategoriesAsync().ConfigureAwait(false);
+            if (groups == null || groups.Count == 0) return;
+            var keepSelected = SelectedCategory;
+            PlaylistCategories.Clear();
+            PlaylistCategories.Add(new LxCategoryChip("全部", null, keepSelected?.TagId == null));
+            foreach (var g in groups)
+                foreach (var t in g.Tags)
+                    PlaylistCategories.Add(new LxCategoryChip(t.Name, t.Id, t.Id == keepSelected?.TagId));
+            // 选中态：默认「全部」
+            SelectedCategory = PlaylistCategories.FirstOrDefault(c => c.IsSelected) ?? PlaylistCategories.FirstOrDefault();
+        }
+        catch { }
+    }
+
+    /// <summary>加载歌单列表（按排序 + 分类）。</summary>
+    private async Task LoadPlaylistsAsync()
+    {
+        IsBusy = true;
+        try
+        {
+            var tagId = SelectedCategory?.TagId;
+            List<OnlinePlaylist> list = PlaylistSort == LxPlaylistSort.New
+                ? await _plugin.GetPlaylistsNewAsync(tagId, 1, 20).ConfigureAwait(false)
+                : await _plugin.GetPlaylistsAsync(tagId).ConfigureAwait(false);
+            Playlists.Clear();
+            if (list != null)
+            {
+                foreach (var p in list) Playlists.Add(p);
+                if (list.Count == 0) ShowTip(PlaylistSort == LxPlaylistSort.New ? "没有最新歌单" : "没有找到该分类歌单");
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>加载排行榜列表（酷我 25 榜单）。</summary>
+    private async Task LoadToplistsAsync()
+    {
+        IsBusy = true;
+        try
+        {
+            var tops = await _plugin.GetToplistsAsync().ConfigureAwait(false);
+            Toplists.Clear();
+            foreach (var p in tops) Toplists.Add(p);
+            if (tops.Count == 0) ShowTip("排行榜加载失败，请检查网络");
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>打开歌单/榜单详情页（推入 Shell）。先取歌曲，再 push 详情页。</summary>
+    [RelayCommand]
+    private async Task OpenPlaylistAsync(OnlinePlaylist? playlist)
+    {
+        if (playlist == null) return;
+        IsBusy = true;
+        List<OnlineSong>? songs = null;
+        try
+        {
+            songs = await _plugin.GetPlaylistSongsAsync(playlist, 1, 80).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+        if (songs == null) { ShowTip("歌单加载失败，请检查网络"); return; }
+        var page = new LxPlaylistDetailPage(playlist, songs, _services, this);
+        try
+        {
+            if (Shell.Current?.Navigation is { } nav) await nav.PushAsync(page);
+        }
+        catch { }
+    }
+
     // ── 播放（点击/菜单播放：只取被点那一首的直链，单首入队播放）──
+
+    /// <summary>公开：脚本是否就绪（详情页判断，避免暴露内部插件引用）。</summary>
+    public bool ScriptReady => _plugin.ScriptReady;
+
+    /// <summary>播放整列表（歌单详情「播放全部」）：逐首取直链入队，任一失败跳过不阻断。</summary>
+    public async Task PlayAllSongsAsync(IReadOnlyList<OnlineSong> songs, string playName)
+    {
+        if (songs.Count == 0) return;
+        if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本（用于解析播放直链）"); return; }
+        try
+        {
+            var queueSongs = new List<Song>(songs.Count);
+            foreach (var os in songs)
+            {
+                var url = await _plugin.GetPlayUrlAsync(os, _plugin.Config.QualityLevel).ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(url)) continue;
+                queueSongs.Add(LxPlaybackHelper.ToQueueSong(os, url));
+            }
+            if (queueSongs.Count == 0) { ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）"); return; }
+            var queue = _services.GetRequiredService<PlayQueue>();
+            var player = _services.GetRequiredService<IAudioPlayerService>();
+            queue.SetSongs(queueSongs);
+            queue.SelectSong(queueSongs[0].Id);
+            await player.PlayAsync(queueSongs[0].FilePath);
+            ShowTip($"正在播放：{playName}");
+        }
+        catch (Exception ex)
+        {
+            ShowTip($"播放失败：{ex.Message}");
+        }
+    }
 
     [RelayCommand]
     private async Task PlaySongAsync(OnlineSong? song)
@@ -311,9 +582,9 @@ public partial class LxOnlineMusicViewModel : ObservableObject
             if (string.IsNullOrWhiteSpace(url)) { ShowTip("暂时取不到播放链接（可能为 VIP 或源失效）"); return; }
             var ext = q == 2 ? "flac" : "mp3";
             var fileName = $"{SanitizeFileName(song.Title)} - {SanitizeFileName(song.Artist)}.{ext}";
-            var dm = _services.GetService<CatClawMusic.Core.Interfaces.IDownloadManager>();
+            var dm = _services.GetService<IDownloadManager>();
             if (dm == null) { ShowTip("宿主下载管理器不可用"); return; }
-            var id = dm.EnqueueUrl(url, fileName);
+            dm.EnqueueUrl(url, fileName);
             ShowTip($"已开始下载「{fileName}」，可在宿主下载中心查看");
         }
         catch (Exception ex)
@@ -385,10 +656,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     {
         ScriptUrl = "";
         ScriptFilePath = "";
-        _plugin.Config.ScriptUrl = "";
-        _plugin.Config.ScriptFilePath = "";
-        LxConfigStore.Save(_plugin.Config);
-        _ = _plugin.LoadScriptAsync("");
+        _plugin.ClearScript(); // 删除持久化文件并清空配置
         ScriptStatus = "未导入脚本";
         RebuildSourceChips();
         ShowTip("已清除脚本");
@@ -539,7 +807,32 @@ public static class LxPlaybackHelper
     };
 }
 
-/// <summary>音源/榜单 chip 项</summary>
+/// <summary>主 Tab（顶部主导航：搜索 / 歌单 / 排行榜）。</summary>
+public enum LxUiTab { Search, Playlist, Ranking }
+
+/// <summary>搜索页子 Tab（歌曲 / 歌单）。</summary>
+public enum LxSearchTab { Song, Playlist }
+
+/// <summary>歌单页排序（最热 / 最新）。</summary>
+public enum LxPlaylistSort { Hot, New }
+
+/// <summary>歌单分类 chip 项（Name=标签名，TagId=酷我标签id，null=「全部」）。</summary>
+public partial class LxCategoryChip : ObservableObject
+{
+    public string Name { get; }
+    public string? TagId { get; }
+
+    [ObservableProperty]
+    private bool _isSelected;
+
+    public LxCategoryChip(string name, string? tagId, bool isSelected)
+    {
+        Name = name;
+        TagId = tagId;
+        IsSelected = isSelected;
+    }
+}
+
 public partial class LxSourceChipItem : ObservableObject
 {
     public string Name { get; }

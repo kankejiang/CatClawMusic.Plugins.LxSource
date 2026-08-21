@@ -170,6 +170,70 @@ public static class LxUiKit
         });
     }
 
+    /// <summary>歌单/榜单卡片模板（2 列网格）：16:9 圆角封面图 + 右上歌曲数徽标 + 名称两行。
+    /// Tap 命令绑定到指定源，参数为 <see cref="OnlinePlaylist"/> 项本身。</summary>
+    public static DataTemplate CreatePlaylistCardTemplate(object commandSource, string commandPropertyName)
+    {
+        return new DataTemplate(() =>
+        {
+            var coverImage = new Image
+            {
+                Aspect = Aspect.AspectFill,
+                HeightRequest = 100,
+                WidthRequest = 100,
+            };
+            coverImage.SetBinding(Image.SourceProperty, new Binding(nameof(OnlinePlaylist.CoverUrl),
+                converter: OnlineUrlToStreamImageConverter.Instance) { TargetNullValue = "ic_music_note" });
+
+            var countBadge = new Label
+            {
+                FontSize = 9,
+                TextColor = Colors.White,
+                BackgroundColor = Color.FromArgb("#A6000000"),
+                Padding = new Thickness(6, 2),
+                VerticalOptions = LayoutOptions.Start,
+                HorizontalOptions = LayoutOptions.End,
+                Margin = new Thickness(0, 4, 4, 0),
+            };
+            countBadge.SetBinding(Label.TextProperty,
+                new Binding(nameof(OnlinePlaylist.SongCount)) { StringFormat = "{0}首" });
+
+            var coverBorder = new Border
+            {
+                StrokeThickness = 0,
+                StrokeShape = new RoundRectangle { CornerRadius = 12 },
+                Clip = new RoundRectangleGeometry { CornerRadius = 12 },
+                HeightRequest = 100,
+            };
+            coverBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+            coverBorder.Content = new Grid { Children = { coverImage, countBadge } };
+
+            var nameLabel = new Label { FontSize = 12, FontFamily = "OpenSansSemibold", MaxLines = 2, LineBreakMode = LineBreakMode.TailTruncation };
+            nameLabel.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
+            nameLabel.SetBinding(Label.TextProperty, nameof(OnlinePlaylist.Name));
+
+            var card = new Border
+            {
+                StrokeThickness = 0,
+                StrokeShape = new RoundRectangle { CornerRadius = 14 },
+                Padding = new Thickness(6),
+                Margin = new Thickness(5, 6),
+            };
+            card.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
+            card.Content = new VerticalStackLayout
+            {
+                Spacing = 4,
+                Children = { coverBorder, nameLabel },
+            };
+
+            var tap = new TapGestureRecognizer();
+            tap.SetBinding(TapGestureRecognizer.CommandProperty, new Binding(commandPropertyName, source: commandSource));
+            tap.SetBinding(TapGestureRecognizer.CommandParameterProperty, new Binding("."));
+            card.GestureRecognizers.Add(tap);
+            return card;
+        });
+    }
+
     // ── 值转换器 ──
 
     /// <summary>DurationMs（long，毫秒）→ "m:ss" / "h:mm:ss"</summary>

@@ -16,6 +16,10 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     private LxConfig _config = new();
     private LxScriptHost? _script;
 
+    /// <summary>脚本内容持久化文件（{数据目录}/scripts/lx_source.js）：
+    /// 导入成功后把脚本原文写到此私有文件，重启后从这里恢复，不依赖原始临时路径/在线 URL。</summary>
+    private static readonly string ScriptPersistPath = Path.Combine(LxConfigStore.DataDir, "scripts", "lx_source.js");
+
     /// <summary>整页 VM 插件级单例（配置与搜索状态跨页面保留）</summary>
     private static LxOnlineMusicViewModel? _sharedVm;
 
@@ -91,6 +95,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         _script ??= new LxScriptHost();
         var ok = await _script.LoadAsync(jsUrl);
         if (!ok) _script = null;
+        else PersistScript();
         return ok;
     }
 
@@ -106,7 +111,39 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         _script ??= new LxScriptHost();
         var ok = await _script.LoadFromFileAsync(filePath);
         if (!ok) _script = null;
+        else PersistScript();
         return ok;
+    }
+
+    /// <summary>把已加载脚本原文写入私有持久文件，并把配置指向它（重启即可恢复）。</summary>
+    private void PersistScript()
+    {
+        var code = _script?.ScriptCode;
+        if (string.IsNullOrWhiteSpace(code)) return;
+        try
+        {
+            var dir = Path.GetDirectoryName(ScriptPersistPath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(ScriptPersistPath, code);
+            _config.ScriptFilePath = ScriptPersistPath;
+            _config.ScriptUrl = ""; // 已本地持久化，无需再依赖在线 URL
+            LxConfigStore.Save(_config);
+        }
+        catch
+        {
+            // 持久化失败不阻塞（本次仍可用，仅重启后需重导）
+        }
+    }
+
+    /// <summary>清除脚本：删除持久化文件并清空配置。</summary>
+    public void ClearScript()
+    {
+        _script?.Dispose();
+        _script = null;
+        try { if (File.Exists(ScriptPersistPath)) File.Delete(ScriptPersistPath); } catch { }
+        _config.ScriptUrl = "";
+        _config.ScriptFilePath = "";
+        LxConfigStore.Save(_config);
     }
 
     /// <summary>保存配置（音质 + 默认源 + 脚本地址/路径）</summary>
@@ -228,11 +265,67 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         return r == null ? null : (r.Value.Lrc, r.Value.TLrc);
     }
 
-    public Task<List<OnlinePlaylist>> GetPlaylistsAsync(string? category = null)
-        => Task.FromResult(new List<OnlinePlaylist>());
+    public async Task<List<OnlinePlaylist>> GetPlaylistsAsync(string? category = null)
+    {
+        // 若未加载脚本，也不影响：歌单、榜单、搜索全部走内置酷我 API
+        // category == null：推荐歌单（默认最热）；否则：分类标签id
+        var r = await LxKuwoApi.GetPlaylistsAsync(category, page: 1, pageSize: 20, sort: "hot").ConfigureAwait(false);
+        // Fail-safe：若 API 偶发失败，返回空列表而不是 null，接口契约是 Task<List<OnlinePlaylist>>
+        return r ?? new List<OnlinePlaylist>();
+    }
 
-    public Task<List<OnlineSong>?> GetPlaylistSongsAsync(OnlinePlaylist playlist, int page = 1, int pageSize = 50)
-        => Task.FromResult<List<OnlineSong>?>(null);
+    /// <summary>最新歌单（非接口方法，UI 里「最新/最热」切换时调用）。</summary>
+    public async Task<List<OnlinePlaylist>> GetPlaylistsNewAsync(string? category = null, int page = 1, int pageSize = 20)
+    {
+        var r = await LxKuwoApi.GetPlaylistsAsync(category, page, pageSize, sort: "new").ConfigureAwait(false);
+        return r ?? new List<OnlinePlaylist>();
+    }
+
+    /// <summary>歌单搜索（对应图里搜索页的「歌单」tab，插件侧扩展方法，宿主会用反射/适配调用）。</summary>
+    public async Task<List<OnlinePlaylist>?> SearchPlaylistsAsync(string keyword, int page = 1, int pageSize = 20)
+        => await LxKuwoApi.SearchPlaylistsAsync(keyword, page, pageSize).ConfigureAwait(false);
+
+    /// <summary>榜单（排行榜页：飙升榜/新歌榜/热歌榜/抖音热歌榜…）。
+    /// 项 Id="kw__&lt;bangId&gt;"，<see cref="GetPlaylistSongsAsync"/> 据此切换到 kbangserver 拉榜单歌曲。</summary>
+    public async Task<List<OnlinePlaylist>> GetToplistsAsync()
+    {
+        var boards = LxKuwoApi.GetBoards();
+        // 并行拉 25 个榜单头信息（每个请求极小 ~1KB），比串行快 10x+
+        var tasks = new Task<(LxBoardItem Board, (string Name, string? Cover, string? Info, int Num)? Head)>[boards.Count];
+        for (var i = 0; i < boards.Count; i++)
+        {
+            var b = boards[i];
+            tasks[i] = WrapHead(b);
+        }
+        static async Task<(LxBoardItem Board, (string Name, string? Cover, string? Info, int Num)? Head)> WrapHead(LxBoardItem bb)
+        {
+            try { return (bb, await LxKuwoApi.GetBoardHeadAsync(bb.BangId).ConfigureAwait(false)); }
+            catch { return (bb, null); }
+        }
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+
+        var list = new List<OnlinePlaylist>(tasks.Length);
+        foreach (var t in tasks)
+        {
+            var (b, head) = t.Result;
+            list.Add(new OnlinePlaylist
+            {
+                Id = b.Id,
+                Platform = "lx",
+                Name = head.HasValue && !string.IsNullOrEmpty(head.Value.Name) ? head.Value.Name : b.Name,
+                Description = head.HasValue && !string.IsNullOrEmpty(head.Value.Info) ? head.Value.Info : $"酷我音乐 · {b.Name}",
+                CoverUrl = head.HasValue ? head.Value.Cover : null,
+                SongCount = head.HasValue && head.Value.Num > 0 ? head.Value.Num : 300,
+            });
+        }
+        return list;
+    }
+
+    public async Task<List<OnlineSong>?> GetPlaylistSongsAsync(OnlinePlaylist playlist, int page = 1, int pageSize = 50)
+    {
+        if (playlist == null || string.IsNullOrWhiteSpace(playlist.Id)) return null;
+        return await LxKuwoApi.GetPlaylistSongsAsync(playlist.Id, page, pageSize).ConfigureAwait(false);
+    }
 
     // ── ILyricsProviderPlugin：宿主歌词兜底链（RemoteId "lx:source:id" 路由）──
 
@@ -293,6 +386,18 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
         if (os.Internal != null && os.Internal.TryGetValue("Source", out var src) && src is string srcStr && !string.IsNullOrWhiteSpace(srcStr))
         {
             source = srcStr;
+            // Internal 已有 Source（酷我搜索/榜单歌曲）：id 优先取裸 RawId；
+            // 没有 RawId 时从 "source:id" 复合 id 拆出冒号后部分。
+            // ⚠ 不能直接用 os.Id——它带 "kw:" 前缀，酷我 API/脚本会把整个当 songmid 请求 → 取不到播放链接。
+            if (os.Internal.TryGetValue("RawId", out var rid) && rid is string rawStr && !string.IsNullOrWhiteSpace(rawStr))
+            {
+                id = rawStr;
+            }
+            else
+            {
+                var idx = os.Id.IndexOf(':');
+                if (idx > 0) id = os.Id[(idx + 1)..];
+            }
         }
         else
         {

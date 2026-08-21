@@ -27,7 +27,7 @@ public static class LxLrcParser
         var trans = ParseStream(tlyric);
         var roma = ParseStream(rlyric);
 
-        var lines = new List<LrcLyricLine>();
+        var lines = new List<LrcLyricLine>(main.Count);
         foreach (var (ts, text) in main)
         {
             var line = new LrcLyricLine { Timestamp = ts, Text = text };

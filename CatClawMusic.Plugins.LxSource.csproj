@@ -1,9 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net11.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <LangVersion>preview</LangVersion>
     <RootNamespace>CatClawMusic.Plugins.LxSource</RootNamespace>
     <AssemblyName>CatClawMusic.Plugins.LxSource</AssemblyName>
     <!-- 插件以独立 DLL 交付，不携带依赖（Core/MAUI 由宿主提供） -->
@@ -18,7 +19,7 @@
     <ProjectReference Include="..\CatClawMusic\CatClawMusic.Core\CatClawMusic.Core.csproj" />
     <!-- 引用 MAUI Controls：插件用 C# 代码构建 UI（不用 XAML，避免跨程序集编译问题）。
          版本与宿主一致（10.0.20），CopyLocalLockFileAssemblies=false 保证不随插件分发。 -->
-    <PackageReference Include="Microsoft.Maui.Controls" Version="10.0.20" />
+    <PackageReference Include="Microsoft.Maui.Controls" Version="11.0.0-preview.7.26406.9" />
     <!-- MVVM Toolkit：插件 ViewModel 使用 ObservableObject/RelayCommand -->
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <!-- Jint JS 引擎：运行 lx-music 自定义源 .js。以嵌入资源分发（不随插件输出 DLL），

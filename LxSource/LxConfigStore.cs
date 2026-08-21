@@ -27,6 +27,9 @@ public static class LxConfigStore
     private static readonly string Dir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CatClawMusic.Maui");
 
+    /// <summary>宿主数据目录（脚本持久化文件也放这里，随应用常驻、卸载才清除）</summary>
+    public static string DataDir => Dir;
+
     private static readonly string FilePath = Path.Combine(Dir, "lx_source_config.json");
 
     /// <summary>读取配置（文件缺失/损坏时返回默认值）</summary>

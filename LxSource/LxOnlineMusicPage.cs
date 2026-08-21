@@ -44,13 +44,84 @@ public class LxOnlineMusicPage : ContentPage
         _vm.OnAppearing();
     }
 
-    /// <summary>主内容：header + 搜索框 + 榜单 chips + 歌曲列表 + loading/tip</summary>
+    /// <summary>主内容：header + 主 Tab（搜索/歌单/排行榜）+ 内容区（随当前 Tab 切换）+ loading/tip</summary>
     private Grid BuildMainContent()
     {
         // ── header：返回 + 标题 + ⚙ ──
         var header = BuildHeader();
 
-        // ── 搜索框（酷我搜索）──
+        // ── 主 Tab chips（搜索 / 歌单 / 排行榜）──
+        var mainTabsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 4, 16, 4) };
+        BindableLayout.SetItemsSource(mainTabsLayout, _vm.MainTabs);
+        BindableLayout.SetItemTemplate(mainTabsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SwitchMainTabCommand)));
+
+        // ── 内容区（三个 section 叠加，随 CurrentTab 显示对应一个）──
+        var body = new Grid
+        {
+            IsEnabled = true,
+            Children = { BuildSearchSection(), BuildPlaylistSection(), BuildRankingSection() },
+        };
+
+        // ── loading / tip ──
+        var loadingIndicator = new ActivityIndicator
+        {
+            WidthRequest = 36,
+            HeightRequest = 36,
+            VerticalOptions = LayoutOptions.Center,
+            HorizontalOptions = LayoutOptions.Center,
+        };
+        loadingIndicator.SetDynamicResource(ActivityIndicator.ColorProperty, "PrimaryColor");
+        loadingIndicator.SetBinding(ActivityIndicator.IsRunningProperty, nameof(LxOnlineMusicViewModel.IsBusy));
+        loadingIndicator.SetBinding(ActivityIndicator.IsVisibleProperty, nameof(LxOnlineMusicViewModel.IsBusy));
+
+        var tipLabel = new Label
+        {
+            FontSize = 12,
+            TextColor = Colors.White,
+            HorizontalTextAlignment = TextAlignment.Center,
+            VerticalTextAlignment = TextAlignment.Center,
+            MaxLines = 2,
+            Padding = new Thickness(14, 8),
+        };
+        tipLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.TipMessage));
+        var tipBorder = new Border
+        {
+            StrokeThickness = 0,
+            StrokeShape = new RoundRectangle { CornerRadius = 14 },
+            BackgroundColor = Color.FromArgb("#CC000000"),
+            Margin = new Thickness(24, 0, 24, 12),
+            VerticalOptions = LayoutOptions.End,
+            HorizontalOptions = LayoutOptions.Center,
+            Content = tipLabel,
+        };
+        tipBorder.SetBinding(VisualElement.IsVisibleProperty, nameof(LxOnlineMusicViewModel.HasTip));
+
+        // 布局：Grid 行（header / 主Tab / 内容区*），loading/tip 覆盖内容区
+        var grid = new Grid
+        {
+            RowDefinitions = new RowDefinitionCollection
+            {
+                new() { Height = GridLength.Auto },  // 0 header
+                new() { Height = GridLength.Auto },  // 1 主 Tab
+                new() { Height = GridLength.Star },  // 2 内容区
+            },
+            Children =
+            {
+                header.GridRow(0),
+                mainTabsLayout.GridRow(1),
+                body.GridRow(2),
+                loadingIndicator.GridRow(2),
+                tipBorder.GridRowSpan(3),
+            },
+        };
+        return grid;
+    }
+
+    // ── 搜索 section：搜索框 + 子Tab(歌曲/歌单) + 榜单chips + 歌曲/歌单列表 ──
+
+    private View BuildSearchSection()
+    {
+        // 搜索框
         var searchEntry = new Entry { Placeholder = "搜索歌曲 / 歌手 / 专辑…" };
         searchEntry.SetDynamicResource(Entry.TextColorProperty, "TextPrimaryColor");
         searchEntry.SetDynamicResource(Entry.PlaceholderColorProperty, "TextHintColor");
@@ -90,7 +161,12 @@ public class LxOnlineMusicPage : ContentPage
         };
         searchBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
 
-        // ── 榜单 chips（横向滚动）──
+        // 搜索子 Tab（歌曲 / 歌单）
+        var searchTabsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 0, 16, 4) };
+        BindableLayout.SetItemsSource(searchTabsLayout, _vm.SearchTabs);
+        BindableLayout.SetItemTemplate(searchTabsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SwitchSearchTabCommand)));
+
+        // 榜单 chips（横向滚动）——搜索页顶部热门榜单（对齐 lx 主页）
         var boardChipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 2, 16, 4) };
         BindableLayout.SetItemsSource(boardChipsLayout, _vm.BoardChips);
         BindableLayout.SetItemTemplate(boardChipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SelectBoardCommand)));
@@ -103,7 +179,7 @@ public class LxOnlineMusicPage : ContentPage
             Content = boardChipsLayout,
         };
 
-        // ── 列表标题 + 歌曲列表 ──
+        // 列表标题
         var listTitleLabel = new Label
         {
             FontSize = 13,
@@ -114,86 +190,151 @@ public class LxOnlineMusicPage : ContentPage
         listTitleLabel.SetDynamicResource(Label.TextColorProperty, "TextSecondaryColor");
         listTitleLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.ListTitle));
 
+        // 歌曲列表
         _songsView = new CollectionView
         {
             SelectionMode = SelectionMode.Single,
             ItemsLayout = new LinearItemsLayout(ItemsLayoutOrientation.Vertical),
             VerticalOptions = LayoutOptions.Fill,
-            EmptyView = new Label
-            {
-                Text = "加载中…",
-                FontSize = 12,
-                HorizontalTextAlignment = TextAlignment.Center,
-                VerticalTextAlignment = TextAlignment.Center,
-                Margin = new Thickness(24, 40, 24, 0),
-            },
         };
-        ((Label)_songsView.EmptyView).SetDynamicResource(Label.TextColorProperty, "TextHintColor");
+        BuildEmptyView(_songsView);
         _songsView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.Songs));
-        // 长按 → 歌曲操作菜单（命令源为 VM，参数为歌曲项）
         _songsView.ItemTemplate = new DataTemplate(() =>
             LxUiKit.CreateSongItemTemplate(_vm.OpenSongMenuCommand));
-        // 列表滚动即取消所有长按计时（滚动误触兜底：滚动必然触发 Scrolled）
         _songsView.Scrolled += (_, _) => LxUiKit.CancelAllLongPresses();
         _songsView.SelectionChanged += OnSongSelected;
+        _songsView.SetBinding(VisualElement.IsVisibleProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.CurrentSearchTab))
+            { Converter = EnumEqualsConverter.Instance, ConverterParameter = nameof(LxSearchTab.Song) });
 
-        // ── loading / tip ──
-        var loadingIndicator = new ActivityIndicator
+        // 歌单搜索结果（歌单子 Tab）
+        var searchPlaylistView = new CollectionView
         {
-            WidthRequest = 36,
-            HeightRequest = 36,
-            VerticalOptions = LayoutOptions.Center,
-            HorizontalOptions = LayoutOptions.Center,
+            ItemsLayout = new GridItemsLayout(2, ItemsLayoutOrientation.Vertical),
+            VerticalOptions = LayoutOptions.Fill,
         };
-        loadingIndicator.SetDynamicResource(ActivityIndicator.ColorProperty, "PrimaryColor");
-        loadingIndicator.SetBinding(ActivityIndicator.IsRunningProperty, nameof(LxOnlineMusicViewModel.IsBusy));
-        loadingIndicator.SetBinding(ActivityIndicator.IsVisibleProperty, nameof(LxOnlineMusicViewModel.IsBusy));
+        BuildEmptyView(searchPlaylistView);
+        searchPlaylistView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.SearchPlaylistResults));
+        searchPlaylistView.ItemTemplate = LxUiKit.CreatePlaylistCardTemplate(_vm, nameof(LxOnlineMusicViewModel.OpenPlaylistCommand));
+        searchPlaylistView.SetBinding(VisualElement.IsVisibleProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.CurrentSearchTab))
+            { Converter = EnumEqualsConverter.Instance, ConverterParameter = nameof(LxSearchTab.Playlist) });
 
-        var tipLabel = new Label
-        {
-            FontSize = 12,
-            TextColor = Colors.White,
-            HorizontalTextAlignment = TextAlignment.Center,
-            VerticalTextAlignment = TextAlignment.Center,
-            MaxLines = 2,
-            Padding = new Thickness(14, 8),
-        };
-        tipLabel.SetBinding(Label.TextProperty, nameof(LxOnlineMusicViewModel.TipMessage));
-        var tipBorder = new Border
-        {
-            StrokeThickness = 0,
-            StrokeShape = new RoundRectangle { CornerRadius = 14 },
-            BackgroundColor = Color.FromArgb("#CC000000"),
-            Margin = new Thickness(24, 0, 24, 12),
-            VerticalOptions = LayoutOptions.End,
-            HorizontalOptions = LayoutOptions.Center,
-            Content = tipLabel,
-        };
-        tipBorder.SetBinding(VisualElement.IsVisibleProperty, nameof(LxOnlineMusicViewModel.HasTip));
-
-        // 布局：Grid 行（header / 搜索框 / 榜单chips / 标题 / 列表*），loading/tip 覆盖
-        var grid = new Grid
+        var section = new Grid
         {
             RowDefinitions = new RowDefinitionCollection
             {
-                new() { Height = GridLength.Auto },  // 0 header
-                new() { Height = GridLength.Auto },  // 1 搜索框
-                new() { Height = GridLength.Auto },  // 2 榜单 chips
-                new() { Height = GridLength.Auto },  // 3 列表标题
-                new() { Height = GridLength.Star },  // 4 歌曲列表
+                new() { Height = GridLength.Auto },  // 搜索框
+                new() { Height = GridLength.Auto },  // 子Tab
+                new() { Height = GridLength.Auto },  // 榜单 chips
+                new() { Height = GridLength.Auto },  // 列表标题
+                new() { Height = GridLength.Star },  // 列表
             },
             Children =
             {
-                header.GridRow(0),
-                searchBorder.GridRow(1),
+                searchBorder.GridRow(0),
+                searchTabsLayout.GridRow(1),
                 boardChipsScroll.GridRow(2),
                 listTitleLabel.GridRow(3),
                 _songsView.GridRow(4),
-                loadingIndicator.GridRow(4),
-                tipBorder.GridRowSpan(5),
+                searchPlaylistView.GridRow(4),
             },
         };
-        return grid;
+        section.SetBinding(VisualElement.IsVisibleProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.CurrentTab))
+            { Converter = EnumEqualsConverter.Instance, ConverterParameter = nameof(LxUiTab.Search) });
+        return section;
+    }
+
+    // ── 歌单 section：排序(最热/最新) + 分类chips + 歌单网格 ──
+
+    private View BuildPlaylistSection()
+    {
+        // 排序 chips（最热 / 最新）
+        var sortChipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 0, 16, 4) };
+        BindableLayout.SetItemsSource(sortChipsLayout, _vm.PlaylistSortChips);
+        BindableLayout.SetItemTemplate(sortChipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SwitchPlaylistSortCommand)));
+
+        // 分类 chips（全部 + 各标签，横向滚动）
+        var categoryChipsLayout = new HorizontalStackLayout { Spacing = 6, Padding = new Thickness(16, 0, 16, 4) };
+        BindableLayout.SetItemsSource(categoryChipsLayout, _vm.PlaylistCategories);
+        BindableLayout.SetItemTemplate(categoryChipsLayout, LxUiKit.CreateChipTemplate(_vm, nameof(LxOnlineMusicViewModel.SelectPlaylistCategoryCommand)));
+        var categoryScroll = new ScrollView
+        {
+            Orientation = ScrollOrientation.Horizontal,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Never,
+            HeightRequest = 36,
+            VerticalOptions = LayoutOptions.Start,
+            Content = categoryChipsLayout,
+        };
+
+        // 歌单网格（2 列卡片）
+        var playlistsView = new CollectionView
+        {
+            ItemsLayout = new GridItemsLayout(2, ItemsLayoutOrientation.Vertical),
+            VerticalOptions = LayoutOptions.Fill,
+        };
+        BuildEmptyView(playlistsView);
+        playlistsView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.Playlists));
+        playlistsView.ItemTemplate = LxUiKit.CreatePlaylistCardTemplate(_vm, nameof(LxOnlineMusicViewModel.OpenPlaylistCommand));
+
+        var section = new Grid
+        {
+            RowDefinitions = new RowDefinitionCollection
+            {
+                new() { Height = GridLength.Auto },  // 排序
+                new() { Height = GridLength.Auto },  // 分类
+                new() { Height = GridLength.Star },  // 歌单网格
+            },
+            Children =
+            {
+                sortChipsLayout.GridRow(0),
+                categoryScroll.GridRow(1),
+                playlistsView.GridRow(2),
+            },
+        };
+        section.SetBinding(VisualElement.IsVisibleProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.CurrentTab))
+            { Converter = EnumEqualsConverter.Instance, ConverterParameter = nameof(LxUiTab.Playlist) });
+        return section;
+    }
+
+    // ── 排行榜 section：酷我全部榜单网格 ──
+
+    private View BuildRankingSection()
+    {
+        var toplistsView = new CollectionView
+        {
+            ItemsLayout = new GridItemsLayout(2, ItemsLayoutOrientation.Vertical),
+            VerticalOptions = LayoutOptions.Fill,
+        };
+        BuildEmptyView(toplistsView);
+        toplistsView.SetBinding(CollectionView.ItemsSourceProperty, nameof(LxOnlineMusicViewModel.Toplists));
+        toplistsView.ItemTemplate = LxUiKit.CreatePlaylistCardTemplate(_vm, nameof(LxOnlineMusicViewModel.OpenPlaylistCommand));
+
+        var section = new Grid
+        {
+            Children = { toplistsView },
+        };
+        section.SetBinding(VisualElement.IsVisibleProperty,
+            new Binding(nameof(LxOnlineMusicViewModel.CurrentTab))
+            { Converter = EnumEqualsConverter.Instance, ConverterParameter = nameof(LxUiTab.Ranking) });
+        return section;
+    }
+
+    /// <summary>为 CollectionView 设置统一的空状态提示。</summary>
+    private static void BuildEmptyView(CollectionView view)
+    {
+        var empty = new Label
+        {
+            Text = "加载中…",
+            FontSize = 12,
+            HorizontalTextAlignment = TextAlignment.Center,
+            VerticalTextAlignment = TextAlignment.Center,
+            Margin = new Thickness(24, 40, 24, 0),
+        };
+        empty.SetDynamicResource(Label.TextColorProperty, "TextHintColor");
+        view.EmptyView = empty;
     }
 
     // ── header ──
@@ -755,6 +896,17 @@ internal sealed class SongTitleConverter : IValueConverter
     public static readonly SongTitleConverter Instance = new();
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
         => value is OnlineSong s ? $"{s.Title} - {s.Artist}" : "";
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => throw new NotSupportedException();
+}
+
+/// <summary>枚举值是否等于参数（ConverterParameter 为枚举成员名，如 "Playlist"）。</summary>
+internal sealed class EnumEqualsConverter : IValueConverter
+{
+    public static readonly EnumEqualsConverter Instance = new();
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+        => value != null && parameter != null
+           && string.Equals(value.ToString(), parameter.ToString(), StringComparison.Ordinal);
     public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
         => throw new NotSupportedException();
 }

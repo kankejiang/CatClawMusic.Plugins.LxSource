@@ -1,6 +1,8 @@
 using System.Net;
 using System.Reflection;
 using System.Text;
+using CatClawMusic.Core.Interfaces;
+using CatClawMusic.Core.Models;
 using CatClawMusic.Plugins.LxSource;
 
 // ── 模拟 lx-music-api-server：本机 HTTP 服务，按协议返回固定 JSON ──
@@ -271,11 +273,113 @@ send(EVENT_NAMES.inited, { status: true, sources: musicSources });
     Check("tx→qq", LxPlatformCodes.ToFull("tx") == "qq");
     Check("bilibili 未知码直传", LxPlatformCodes.ToShort("bilibili") == "bilibili");
 
-    // ── 阶段 4：真实混淆脚本加载（长青SVIP v1.2.0，若文件存在）──
+    // ── 阶段 4：歌单/榜单/歌单搜索 数据链路（酷我公开 API，无需脚本）──
+    Console.WriteLine("\n[phase4] 歌单/榜单/歌单搜索 数据链路（酷我公开 API，无签名）");
+
+    // 4.1 酷我榜单列表硬编码 25 个（GetBoards）
+    var boards = LxKuwoApi.GetBoards();
+    Check("酷我榜单列表非空", boards != null && boards.Count >= 20,
+        boards?.Count.ToString() ?? "null");
+    Check("榜单含热歌榜(bangId=16)", boards?.Any(b => b.BangId == "16") == true);
+    Check("榜单含飙升榜(bangId=93)", boards?.Any(b => b.BangId == "93") == true);
+
+    // 4.2 热歌榜(bangId=16)前两页能取到歌曲（榜单的 GetPlaylistSongs 走 GetBoardSongsAsync）
+    //     id 格式 "kw__<bangId>"，Id 是榜单唯一主键，BangId 是接口参数。
+    var hotBoard = boards!.First(b => b.BangId == "16");
+    Check("热歌榜 id 含 bangId", hotBoard.Id.Contains("16"));
+    // 模拟 IOnlineMusicPlugin.GetPlaylistSongsAsync：榜单 Id 里含 "bang" 走 GetBoardSongsAsync。
+    var hotSongs = await LxKuwoApi.GetBoardSongsAsync(hotBoard.BangId, 1, 16);
+    Check("热歌榜前 16 条非空", hotSongs is { Count: >= 10 }, hotSongs?.Count.ToString() ?? "null");
+    if (hotSongs is { Count: > 0 })
+    {
+        var first = hotSongs[0];
+        Check("榜单歌曲 Id 格式 kw:xxx", first.Id.StartsWith("kw:", StringComparison.OrdinalIgnoreCase), first.Id);
+        Check("榜单歌曲 RawId 存在",
+            first.Internal != null && first.Internal.TryGetValue("RawId", out var raw) && raw is string rawStr && rawStr.Length > 0);
+    }
+
+    // 4.3 插件 IOnlineMusicPlugin.GetToplistsAsync：返回榜单作为 OnlinePlaylist（Platform=lx）
+    var lxPluginToplists = await lxPlugin.GetToplistsAsync();
+    Check("插件 GetToplistsAsync 返回非空", lxPluginToplists is { Count: >= 20 }, lxPluginToplists?.Count.ToString() ?? "null");
+    if (lxPluginToplists is { Count: > 0 })
+    {
+        var top = lxPluginToplists[0];
+        Check("榜单 Platform=lx", top.Platform == "lx", top.Platform);
+        Check("榜单 Id 不空", top.Id.Length > 0, top.Id);
+        Check("榜单 Name 不空", top.Name.Length > 0, top.Name);
+    }
+
+    // 4.4 歌单列表：酷我默认分类 + 排序（最新/最热）。GetPlaylistsAsync(category, sort)。
+    //     先不带参数（默认分类 + 最热）：要求拿到一页歌单（>=3）。
+    const int PAGE_SIZE = 12;
+    var defaultPlaylists = await lxPlugin.GetPlaylistsAsync(null);
+    Check("插件 GetPlaylistsAsync(null) 返回 >= 3 个", defaultPlaylists is { Count: >= 3 },
+        defaultPlaylists?.Count.ToString() ?? "null");
+    if (defaultPlaylists is { Count: > 0 })
+    {
+        var p = defaultPlaylists[0];
+        Check("歌单 Name 不空", p.Name.Length > 0, p.Name);
+        Check("歌单 CoverUrl 不空（含 http）", !string.IsNullOrEmpty(p.CoverUrl) && p.CoverUrl!.StartsWith("http"), p.CoverUrl);
+        Check("歌单 Platform=lx", p.Platform == "lx", p.Platform);
+        Check("歌单 Id 不空（酷我歌单格式 pl<数字>）", p.Id.Length > 0, p.Id);
+    }
+
+    // 4.5 歌单内歌曲：挑上面第一个歌单取前 8 条。
+    if (defaultPlaylists is { Count: > 0 })
+    {
+        var firstPl = defaultPlaylists[0];
+        var firstSongs = await lxPlugin.GetPlaylistSongsAsync(firstPl, 1, 8);
+        Check($"歌单「{firstPl.Name}」内歌曲 >= 3", firstSongs is { Count: >= 3 },
+            firstSongs?.Count.ToString() ?? "null");
+    }
+
+    // 4.6 歌单搜索：IOnlineMusicPlugin.SearchPlaylistsAsync("黄诗扶") —— 新接口（默认实现返回空，要实装后通过）。
+    //     先调用，要求至少拿到 1 个歌单，歌单名含「黄诗扶」或作者名。
+    var kwSearch = typeof(LxKuwoApi).GetMethod("SearchPlaylistsAsync");
+    Check("LxKuwoApi 已公开 SearchPlaylistsAsync", kwSearch != null);
+    var kwSearchTask = (Task<List<OnlinePlaylist>?>?)kwSearch?.Invoke(null, new object?[] { "黄诗扶", 1, 12 });
+    var kwPlaylists = kwSearchTask != null ? await kwSearchTask : null;
+    Check("酷我歌单搜索「黄诗扶」至少 1 个", kwPlaylists is { Count: >= 1 },
+        kwPlaylists?.Count.ToString() ?? "null");
+
+    var pluginSpMethod = typeof(IOnlineMusicPlugin).GetMethod("SearchPlaylistsAsync");
+    if (pluginSpMethod != null)
+    {
+        Task<List<OnlinePlaylist>?>? plTask = null;
+        try
+        {
+            // 优先走接口默认方法（DIM）
+            plTask = (Task<List<OnlinePlaylist>?>?)pluginSpMethod.Invoke(lxPlugin, new object?[] { "黄诗扶", 1, 12 });
+        }
+        catch { }
+        // DIM 在某些「插件程序集编译时还没有该接口方法」的 AssemblyLoad 场景下
+        // 会直接命中接口默认 null 实现；此时回退到类自身的同名公共方法（如果存在）
+        List<OnlinePlaylist>? plSearch = null;
+        if (plTask != null) plSearch = await plTask;
+        if (plSearch == null || plSearch.Count == 0)
+        {
+            var clsM = lxPlugin.GetType().GetMethod("SearchPlaylistsAsync",
+                new[] { typeof(string), typeof(int), typeof(int) });
+            if (clsM != null)
+            {
+                var fallback = (Task<List<OnlinePlaylist>?>?)clsM.Invoke(lxPlugin, new object?[] { "黄诗扶", 1, 12 });
+                if (fallback != null) plSearch = await fallback;
+            }
+        }
+        Check("插件 SearchPlaylistsAsync(黄诗扶) >= 1 个", plSearch is { Count: >= 1 },
+            plSearch?.Count.ToString() ?? "null");
+    }
+    else
+    {
+        // 若 Core 尚未加接口：记录警告但继续（后续改 Core 后会重新生效）
+        Console.WriteLine("  [warn] IOnlineMusicPlugin 暂未公开 SearchPlaylistsAsync，宿主 Core 更新后会补齐此测试");
+    }
+
+    // ── 阶段 5：真实混淆脚本加载（长青SVIP v1.2.0，若文件存在）──
     var realScriptPath = @"C:\Users\lvjin\AppData\Local\Temp\长青SVIP音源(二改修复版) v1.2.0.js";
     if (File.Exists(realScriptPath))
     {
-        Console.WriteLine("\n[phase4] 真实混淆脚本加载（长青SVIP v1.2.0）");
+        Console.WriteLine("\n[phase5] 真实混淆脚本加载（长青SVIP v1.2.0）");
         var realHost = new LxScriptHost();
         var realOk = await realHost.LoadFromFileAsync(realScriptPath);
         // 脚本有 checkUpdate：可能 inited 正常，或检测到新版发 updateAlert

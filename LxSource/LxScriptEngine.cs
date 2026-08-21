@@ -532,12 +532,18 @@ public class LxScriptHost : IDisposable
     /// <summary>串行化引擎创建/赋值（防止并发加载时 _engine 被覆盖/置空）</summary>
     private readonly object _scriptLock = new();
 
+    /// <summary>脚本动作执行串行锁：Jint 引擎非线程安全，且 lx.request 内为同步阻塞 HTTP，
+    /// 必须让每次 handler.Call 独占引擎并在后台线程执行，避免占用 UI 线程。</summary>
+    private readonly SemaphoreSlim _execLock = new(1, 1);
+
     private Engine? _engine;
     private LxBridge? _bridge;
 
     public bool IsLoaded => _engine != null && _bridge?.Inited == true;
     public string ScriptUrl { get; private set; } = "";
     public string ScriptFilePath { get; private set; } = "";
+    /// <summary>脚本原始内容（执行成功后保留，供插件持久化到私有目录）</summary>
+    public string ScriptCode { get; private set; } = "";
     /// <summary>导入方式：online=URL 拉取，local=本地文件</summary>
     public string ImportMode { get; private set; } = "";
     public LxScriptSources? Sources => _bridge?.Sources;
@@ -619,7 +625,10 @@ public class LxScriptHost : IDisposable
             // ExecuteAsync 会 await 脚本里 pending 的 Promise/async IIFE（如 checkUpdate 后 send inited）
             await engine.ExecuteAsync(code);
             if (bridge.Inited && bridge.Sources != null && bridge.Sources.SourceCodes.Count > 0)
+            {
+                ScriptCode = code;
                 return true;
+            }
             // 脚本发了 updateAlert 但未 inited（检测到新版，拒绝运行旧版）
             if (bridge.HasUpdateAlert)
             {
@@ -649,6 +658,7 @@ public class LxScriptHost : IDisposable
         ScriptUrl = "";
         ScriptFilePath = "";
         ImportMode = "";
+        ScriptCode = "";
     }
 
     /// <summary>脚本是否支持某源某 action。</summary>
@@ -744,13 +754,23 @@ public class LxScriptHost : IDisposable
         try
         {
             var argJs = JsValue.FromObject(_engine, arg);
-            var result = handler.Call(JsValue.Undefined, new JsValue[] { argJs });
-            if (result.IsPromise())
+            // 拿到 handler 后在其初始化之外执行。为避免 Jint 引擎被并发访问以及
+            // lx.request 内同步阻塞 HTTP 卡 UI，把整段 JS 调用放到后台线程并串行化。
+            await _execLock.WaitAsync(ct).ConfigureAwait(false);
+            try
             {
-                var settled = await result.UnwrapIfPromiseAsync(ct).ConfigureAwait(false);
-                return settled;
+                var result = await Task.Run(() => handler.Call(JsValue.Undefined, new JsValue[] { argJs }), ct).ConfigureAwait(false);
+                if (result.IsPromise())
+                {
+                    var settled = await result.UnwrapIfPromiseAsync(ct).ConfigureAwait(false);
+                    return settled;
+                }
+                return result;
             }
-            return result;
+            finally
+            {
+                _execLock.Release();
+            }
         }
         catch (Exception ex)
         {
@@ -762,8 +782,8 @@ public class LxScriptHost : IDisposable
     private static List<LxScriptSearchItem>? ParseSearchResult(JsValue? result)
     {
         if (result == null || !result.IsArray()) return null;
-        var list = new List<LxScriptSearchItem>();
         var arr = result.AsArray();
+        var list = new List<LxScriptSearchItem>((int)arr.Length);
         for (uint i = 0; i < arr.Length; i++)
         {
             var item = arr.Get(i);
