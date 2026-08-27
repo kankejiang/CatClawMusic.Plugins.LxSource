@@ -167,11 +167,7 @@ public sealed class LxPlaylistDetailPage : ContentPage
         return grid;
     }
 
-    private async Task PopAsyncSafe()
-    {
-        try { if (Shell.Current?.Navigation is { } nav) await nav.PopAsync(); }
-        catch { }
-    }
+    private Task PopAsyncSafe() => LxNav.PopAsync(this);
 
     /// <summary>播放全部：取直链 → 整列表入队播放。</summary>
     private async Task PlayAllAsync()
@@ -201,7 +197,7 @@ internal sealed class LxPlaylistDetailViewModel
         => _mainVm.PlayAllSongsAsync(songs, playName);
 }
 
-/// <summary>封面 URL → 图片源（空 → 占位图标）。</summary>
+/// <summary>封面 URL → 图片源（空/非法 → 占位图标；http 升 https，酷我/咪咕 CDN 均支持）。</summary>
 internal static class LxDetailCoverConverter
 {
     public static ImageSource ToSource(string? url)
@@ -209,6 +205,9 @@ internal static class LxDetailCoverConverter
         if (string.IsNullOrWhiteSpace(url)) return "ic_music_note";
         // 非法/相对 URL 时回落到占位图标，避免详情页构造抛异常（该构造不在调用方 try 内）
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || !uri.IsAbsoluteUri) return "ic_music_note";
+        if (uri.Scheme == Uri.UriSchemeHttp)
+            // 酷我封面常带显式 :80 端口，升 https 必须重置端口为默认(443)，否则 https:80 超时
+            uri = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttps, Port = -1 }.Uri;
         return ImageSource.FromUri(uri);
     }
 }

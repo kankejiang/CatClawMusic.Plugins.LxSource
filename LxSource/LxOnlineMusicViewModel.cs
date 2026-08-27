@@ -152,17 +152,20 @@ public partial class LxOnlineMusicViewModel : ObservableObject
 
     // ── 榜单 ──
 
+    /// <summary>当前内置源是否为咪咕（false=酷我）。搜索/榜单/封面据此分流。</summary>
+    private bool IsMg => _plugin.BuiltinSource == "mg";
+
     /// <summary>榜单 chips：默认选中"热歌榜"并加载</summary>
     private void RebuildBoardChips()
     {
-        var boards = LxKuwoApi.GetBoards();
+        var boards = IsMg ? LxMiguApi.GetBoards() : LxKuwoApi.GetBoards();
         BoardChips.Clear();
         foreach (var b in boards)
-            BoardChips.Add(new LxSourceChipItem(b.Name, b.Id == "kw__16"));
+            BoardChips.Add(new LxSourceChipItem(b.Name, b.Id == (IsMg ? "mg__27186466" : "kw__16")));
         SelectedBoard = BoardChips.FirstOrDefault(c => c.IsSelected);
     }
 
-    /// <summary>选择榜单 → 加载该榜单歌曲（酷我旧接口，每页 100 首）</summary>
+    /// <summary>选择榜单 → 加载该榜单歌曲（按内置源分流：酷我旧接口每页 100 首 / 咪咕老列结构）</summary>
     [RelayCommand]
     private async Task SelectBoardAsync(LxSourceChipItem? chip)
     {
@@ -173,9 +176,12 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         IsBusy = true;
         try
         {
-            var board = LxKuwoApi.GetBoards().FirstOrDefault(b => b.Name == chip.Name);
+            var board = (IsMg ? LxMiguApi.GetBoards() : LxKuwoApi.GetBoards())
+                .FirstOrDefault(b => b.Name == chip.Name);
             if (board == null) { Songs.Clear(); return; }
-            var songs = await LxKuwoApi.GetBoardSongsAsync(board.BangId);
+            var songs = IsMg
+                ? await LxMiguApi.GetBoardSongsAsync(board.BangId)
+                : await LxKuwoApi.GetBoardSongsAsync(board.BangId);
             Songs.Clear();
             if (songs == null)
             {
@@ -191,38 +197,51 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         }
     }
 
-    /// <summary>后台并发（限 4）预取歌曲封面（酷我 rid_pic API），完成后重建 Songs 触发列表刷新。</summary>
+    /// <summary>后台并发（限 4）预取歌曲封面（酷我 rid_pic API）。后台线程只拉 URL，
+    /// 不触碰 UI 属性；完成后统一回到 UI 线程赋值 CoverUrl 并重建 Songs 触发列表刷新。</summary>
     private async Task EnrichCoversAsync(IReadOnlyList<OnlineSong> songs)
     {
         try
         {
-            var tasks = songs.Select(LoadCoverAsync).ToArray();
-            await Task.WhenAll(tasks);
-            // 封面就绪 → 重建集合触发 CollectionView 刷新
-            MainThread.BeginInvokeOnMainThread(() =>
+            var updates = new List<KeyValuePair<OnlineSong, string>>(songs.Count);
+            await Task.WhenAll(songs.Select(async s =>
             {
-                Songs.Clear();
-                foreach (var s in songs) Songs.Add(s);
-            });
+                var url = await FetchCoverUrlAsync(s).ConfigureAwait(false);
+                if (url != null)
+                    lock (updates) updates.Add(new(s, url));
+            })).ConfigureAwait(false);
+            if (updates.Count == 0) return;
+            await MainThread.InvokeOnMainThreadAsync(() => UpdateSongsWithCovers(songs, updates));
         }
         catch { /* 封面预取失败不影响列表 */ }
     }
 
+    /// <summary>UI 线程重刷列表：先写回封面，再以原始列表重建 Songs（对象与 Songs 内为同一批实例）。</summary>
+    private void UpdateSongsWithCovers(IReadOnlyList<OnlineSong> source, List<KeyValuePair<OnlineSong, string>> updates)
+    {
+        foreach (var (s, url) in updates) s.CoverUrl = url;
+        Songs.Clear();
+        foreach (var s in source) Songs.Add(s);
+    }
+
     private static readonly SemaphoreSlim CoverGate = new(4, 4);
 
-    private static async Task LoadCoverAsync(OnlineSong s)
+    /// <summary>后台拉取单首封面 URL（不修改任何可绑定属性，避免跨线程 PropertyChanged）。</summary>
+    private static async Task<string?> FetchCoverUrlAsync(OnlineSong s)
     {
-        if (s == null || !string.IsNullOrWhiteSpace(s.CoverUrl)) return;
-        if (s.Id == null || !s.Id.StartsWith("kw:", StringComparison.OrdinalIgnoreCase)) return;
-        var songmid = s.Id[3..];
+        if (s == null || !string.IsNullOrWhiteSpace(s.CoverUrl)) return null;
         await CoverGate.WaitAsync();
         try
         {
-            var url = await LxKuwoApi.GetPicAsync(songmid);
-            if (!string.IsNullOrWhiteSpace(url)) s.CoverUrl = url;
+            if (s.Id != null && s.Id.StartsWith("kw:", StringComparison.OrdinalIgnoreCase))
+                return await LxKuwoApi.GetPicAsync(s.Id[3..]).ConfigureAwait(false);
+            if (s.Id != null && s.Id.StartsWith("mg:", StringComparison.OrdinalIgnoreCase)
+                && s.Internal.TryGetValue("ResId", out var rid) && rid is string r && !string.IsNullOrEmpty(r))
+                return await LxMiguApi.GetPicAsync(r).ConfigureAwait(false);
         }
         catch { }
         finally { CoverGate.Release(); }
+        return null;
     }
 
 
@@ -248,7 +267,9 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         IsBusy = true;
         try
         {
-            var songs = await LxKuwoApi.SearchAsync(keyword, 1, 30);
+            var songs = IsMg
+                ? await LxMiguApi.SearchAsync(keyword, 1, 30)
+                : await LxKuwoApi.SearchAsync(keyword, 1, 30);
             Songs.Clear();
             if (songs == null)
             {
@@ -350,7 +371,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
             var catsTask = LoadPlaylistCategoriesAsync();
             var plTask = LoadPlaylistsAsync();
             var topTask = LoadToplistsAsync();
-            await Task.WhenAll(catsTask, plTask, topTask).ConfigureAwait(false);
+            await Task.WhenAll(catsTask, plTask, topTask);
         }
         catch { }
     }
@@ -360,7 +381,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     {
         try
         {
-            var groups = await LxKuwoApi.GetPlaylistCategoriesAsync().ConfigureAwait(false);
+            var groups = await LxKuwoApi.GetPlaylistCategoriesAsync();
             if (groups == null || groups.Count == 0) return;
             var keepSelected = SelectedCategory;
             PlaylistCategories.Clear();
@@ -382,8 +403,8 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         {
             var tagId = SelectedCategory?.TagId;
             List<OnlinePlaylist> list = PlaylistSort == LxPlaylistSort.New
-                ? await _plugin.GetPlaylistsNewAsync(tagId, 1, 20).ConfigureAwait(false)
-                : await _plugin.GetPlaylistsAsync(tagId).ConfigureAwait(false);
+                ? await _plugin.GetPlaylistsNewAsync(tagId, 1, 20)
+                : await _plugin.GetPlaylistsAsync(tagId);
             Playlists.Clear();
             if (list != null)
             {
@@ -403,7 +424,7 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         IsBusy = true;
         try
         {
-            var tops = await _plugin.GetToplistsAsync().ConfigureAwait(false);
+            var tops = await _plugin.GetToplistsAsync();
             Toplists.Clear();
             foreach (var p in tops) Toplists.Add(p);
             if (tops.Count == 0) ShowTip("排行榜加载失败，请检查网络");
@@ -423,20 +444,19 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         List<OnlineSong>? songs = null;
         try
         {
-            songs = await _plugin.GetPlaylistSongsAsync(playlist, 1, 80).ConfigureAwait(false);
+            songs = await _plugin.GetPlaylistSongsAsync(playlist, 1, 80);
         }
         finally
         {
             IsBusy = false;
         }
         if (songs == null) { ShowTip("歌单加载失败，请检查网络"); return; }
-        // 上方 GetPlaylistSongsAsync 用了 ConfigureAwait(false)，续体落在线程池线程；
-        // MAUI Page 构造 + 导航必须占用 UI 线程，否则 Android 跨线程创建控件闪退。
+        // 页面构造 + 导航必须占用 UI 线程（本方法 await 续体现已回到 UI 线程）
         try
         {
             var page = await MainThread.InvokeOnMainThreadAsync(() =>
                 new LxPlaylistDetailPage(playlist, songs!, _services, this));
-            if (Shell.Current?.Navigation is { } nav) await nav.PushAsync(page);
+            await LxNav.PushAsync(page);
         }
         catch { }
     }
@@ -451,6 +471,8 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     {
         if (songs.Count == 0) return;
         if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本（用于解析播放直链）"); return; }
+        // 逐首取直链较慢，点击「播放全部」立即反馈加载中
+        ShowTip($"正在播放：{playName} · 加载中…");
         try
         {
             var queueSongs = new List<Song>(songs.Count);
@@ -479,6 +501,8 @@ public partial class LxOnlineMusicViewModel : ObservableObject
     {
         if (song == null) return;
         if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本（用于解析播放直链）"); return; }
+        // 点击立即反馈：直链解析+缓冲期间先亮「正在播放·加载中」，用户能确认点击已生效
+        ShowTip($"正在播放：{song.Title} · 加载中…");
         try
         {
             var url = await _plugin.GetPlayUrlAsync(song, _plugin.Config.QualityLevel);
@@ -543,6 +567,8 @@ public partial class LxOnlineMusicViewModel : ObservableObject
         CloseSongMenu();
         if (song == null) return;
         if (!_plugin.ScriptReady) { ShowTip("请先在 ⚙ 设置导入音源脚本"); return; }
+        // 取直链期间先亮解析提示，避免菜单关闭后数秒无反馈
+        ShowTip($"「{song.Title}」· 正在解析播放链接…");
         try
         {
             var url = await _plugin.GetPlayUrlAsync(song, _plugin.Config.QualityLevel);

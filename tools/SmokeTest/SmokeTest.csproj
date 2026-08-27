@@ -15,6 +15,7 @@
     <Compile Include="..\..\LxSource\LxLrcParser.cs" Link="LxLrcParser.cs" />
     <Compile Include="..\..\LxSource\LxScriptEngine.cs" Link="LxScriptEngine.cs" />
     <Compile Include="..\..\LxSource\LxKuwoApi.cs" Link="LxKuwoApi.cs" />
+    <Compile Include="..\..\LxSource\LxMiguApi.cs" Link="LxMiguApi.cs" />
     <ProjectReference Include="..\..\..\CatClawMusic\CatClawMusic.Core\CatClawMusic.Core.csproj" />
     <PackageReference Include="Jint" Version="4.16.0" />
     <PackageReference Include="Acornima" Version="1.7.0" />

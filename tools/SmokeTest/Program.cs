@@ -1,7 +1,10 @@
 using System.Net;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using CatClawMusic.Core.Interfaces;
+using Jint;
+using Jint.Native;
 using CatClawMusic.Core.Models;
 using CatClawMusic.Plugins.LxSource;
 
@@ -180,7 +183,7 @@ try
     AppDomain.CurrentDomain.AssemblyResolve += (_, e) =>
         new AssemblyName(e.Name).Name == coreAsm.GetName().Name ? coreAsm : null;
     var pluginPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..",
-        "bin", "Release", "net10.0", "CatClawMusic.Plugins.LxSource.dll"));
+        "bin", "Release", "net11.0", "CatClawMusic.Plugins.LxSource.dll"));
     var asm = System.Reflection.Assembly.LoadFrom(pluginPath);
     var pluginType = asm.GetType("CatClawMusic.Plugins.LxSource.LxMusicPlugin")!;
     var plugin = (CatClawMusic.Core.Interfaces.IPlugin)Activator.CreateInstance(pluginType)!;
@@ -193,6 +196,10 @@ try
     var lxPlugin = (CatClawMusic.Core.Interfaces.IOnlineMusicPlugin)plugin;
     var lxLyricProvider = (CatClawMusic.Core.Interfaces.ILyricsProviderPlugin)plugin;
     dynamic dplugin = plugin;
+
+    // 反射调用插件专用设置（SetBuiltinSource 不在 IOnlineMusicPlugin 接口上）
+    void SetSource(string code) =>
+        lxPlugin.GetType().GetMethod("SetBuiltinSource", new[] { typeof(string) })?.Invoke(lxPlugin, new object?[] { code });
 
     // 加载 mock 脚本（验证嵌入 Jint 在插件 DLL 上下文经 AssemblyResolve 加载）
     bool scriptOk = await dplugin.LoadScriptAsync($"http://127.0.0.1:{Port}/script.js");
@@ -272,6 +279,79 @@ send(EVENT_NAMES.inited, { status: true, sources: musicSources });
     Check("netease→wy", LxPlatformCodes.ToShort("netease") == "wy");
     Check("tx→qq", LxPlatformCodes.ToFull("tx") == "qq");
     Check("bilibili 未知码直传", LxPlatformCodes.ToShort("bilibili") == "bilibili");
+
+    // ── 阶段 3.5：utils.crypto AES/RSA（阶段 1 补齐）──
+    Console.WriteLine("\n[phase3.5] utils.crypto AES/RSA");
+    var cryptoEngine = new Engine();
+    JsValue B(object o) => JsValue.FromObject(cryptoEngine, o);
+    var crypto = new LxCryptoUtils(cryptoEngine);
+
+    // AES-128-CBC：与独立 Aes 参考实现对照（key=YELLOW SUBMARINE, IV=全零, PKCS7）
+    var aesKey = System.Text.Encoding.UTF8.GetBytes("YELLOW SUBMARINE");
+    var aesIv = new byte[16];
+    var aesPlain = System.Text.Encoding.UTF8.GetBytes("This is a test 2026 for lx crypto");
+    var expected = (byte[]?)crypto.aesEncrypt(
+        B(aesPlain), B("aes-128-cbc"),
+        B(aesKey), B(aesIv));
+    Check("aesEncrypt(CBC) 返回非空字节", expected is { Length: > 0 });
+    byte[] refCbc;
+    using (var rAes = Aes.Create())
+    {
+        rAes.Mode = CipherMode.CBC; rAes.Padding = PaddingMode.PKCS7; rAes.KeySize = 128;
+        rAes.Key = aesKey; rAes.IV = aesIv;
+        refCbc = rAes.CreateEncryptor().TransformFinalBlock(aesPlain, 0, aesPlain.Length);
+    }
+    Check("aesEncrypt(CBC) 与参考实现一致",
+        expected is { Length: > 0 } && Convert.ToBase64String(expected) == Convert.ToBase64String(refCbc),
+        expected is null ? "null" : Convert.ToBase64String(expected));
+    var decCbc = (byte[]?)crypto.aesDecrypt(
+        B(expected!), B("aes-128-cbc"),
+        B(aesKey), B(aesIv));
+    Check("aesDecrypt(CBC) 回原文", decCbc != null && decCbc.SequenceEqual(aesPlain));
+
+    // AES-128-ECB：与参考实现对照
+    var expEcb = (byte[]?)crypto.aesEncrypt(
+        B(aesPlain), B("aes-128-ecb"),
+        B(aesKey), B(Array.Empty<byte>()));
+    byte[] refEcb;
+    using (var rAes2 = Aes.Create())
+    {
+        rAes2.Mode = CipherMode.ECB; rAes2.Padding = PaddingMode.PKCS7; rAes2.KeySize = 128;
+        rAes2.Key = aesKey; rAes2.IV = new byte[16];
+        refEcb = rAes2.CreateEncryptor().TransformFinalBlock(aesPlain, 0, aesPlain.Length);
+    }
+    Check("aesEncrypt(ECB) 与参考一致", expEcb != null && expEcb.SequenceEqual(refEcb));
+    var decEcb = (byte[]?)crypto.aesDecrypt(
+        B(expEcb!), B("aes-128-ecb"),
+        B(aesKey), B(Array.Empty<byte>()));
+    Check("aesDecrypt(ECB) 回原文", decEcb != null && decEcb.SequenceEqual(aesPlain));
+
+    // RSA/ECB/NoPadding：生成 2048 密钥，PEM 公钥加密，再用私钥 BigInteger 回解校验 + 等长断言
+    using (var rsa = RSA.Create(2048))
+    {
+        var pubSpki = rsa.ExportSubjectPublicKeyInfo();
+        var pem = "-----BEGIN PUBLIC KEY-----\n" +
+            Convert.ToBase64String(pubSpki, Base64FormattingOptions.InsertLineBreaks) +
+            "\n-----END PUBLIC KEY-----";
+        var sec = System.Text.Encoding.UTF8.GetBytes("secret-key-bytes");
+        var block = new byte[rsa.KeySize / 8];
+        System.Buffer.BlockCopy(sec, 0, block, block.Length - sec.Length, sec.Length);
+        var enc = (byte[]?)crypto.rsaEncrypt(B(block), B(pem));
+        Check("rsaEncrypt 等长输出（256 字节）", enc is { Length: var len } && len == rsa.KeySize / 8,
+            enc?.Length.ToString() ?? "null");
+        // 私钥 BigInteger 回解，验证模幂正确
+        if (enc is { Length: > 0 })
+        {
+            var pp = rsa.ExportParameters(true);
+            var n = new System.Numerics.BigInteger(pp.Modulus!, isUnsigned: true, isBigEndian: true);
+            var d = new System.Numerics.BigInteger(pp.D!, isUnsigned: true, isBigEndian: true);
+            var c = new System.Numerics.BigInteger(enc, isUnsigned: true, isBigEndian: true);
+            var m2 = System.Numerics.BigInteger.ModPow(c, d, n).ToByteArray(isUnsigned: true, isBigEndian: true);
+            var padded = new byte[block.Length];
+            System.Buffer.BlockCopy(m2, 0, padded, padded.Length - m2.Length, Math.Min(m2.Length, padded.Length));
+            Check("rsaEncrypt 私钥回解一致", padded.SequenceEqual(block));
+        }
+    }
 
     // ── 阶段 4：歌单/榜单/歌单搜索 数据链路（酷我公开 API，无需脚本）──
     Console.WriteLine("\n[phase4] 歌单/榜单/歌单搜索 数据链路（酷我公开 API，无签名）");
@@ -375,11 +455,92 @@ send(EVENT_NAMES.inited, { status: true, sources: musicSources });
         Console.WriteLine("  [warn] IOnlineMusicPlugin 暂未公开 SearchPlaylistsAsync，宿主 Core 更新后会补齐此测试");
     }
 
-    // ── 阶段 5：真实混淆脚本加载（长青SVIP v1.2.0，若文件存在）──
+    // ── 阶段 5：咪咕(mg)内置源真实网络链路（搜索/榜单/歌单/歌词/封面）──
+    Console.WriteLine("\n[phase5-migu] 咪咕(mg)内置源真实网络链路");
+
+    // 5.1 榜单列表硬编码
+    Check("咪咕榜单列表非空", LxMiguApi.GetBoards() is { Count: > 0 });
+    Check("榜单含热歌榜(bangid=27186466)",
+        LxMiguApi.GetBoards().Exists(b => b.Id == "mg__27186466" && b.BangId == "27186466"));
+
+    // 5.2 搜索
+    var mgSearch = await LxMiguApi.SearchAsync("黄诗扶", 1, 20);
+    Check("咪咕搜索「黄诗扶」返回 >= 1", mgSearch is { Count: >= 1 }, mgSearch?.Count.ToString() ?? "null");
+    OnlineSong? mgFirst = null;
+    if (mgSearch is { Count: > 0 })
+    {
+        mgFirst = mgSearch[0];
+        Check("搜索 Id 格式 mg:xxx", mgFirst.Id.StartsWith("mg:"), mgFirst.Id);
+        Check("搜索标题非空", mgFirst.Title.Length > 0, mgFirst.Title);
+        Check("搜索歌手或专辑有效", mgFirst.Artist.Length > 0 || mgFirst.Album.Length > 0, $"{mgFirst.Artist}/{mgFirst.Album}");
+        Check("搜索内部源=mg", mgFirst.Internal.TryGetValue("Source", out var _src) && (string)_src == "mg");
+        Check("搜索内部含 ResId=真实 songId", mgFirst.Internal.TryGetValue("ResId", out var _rid) && !string.IsNullOrEmpty((string)_rid!));
+    }
+
+    // 5.3 榜单歌曲
+    var mgBoardSongs = await LxMiguApi.GetBoardSongsAsync("27186466", 50);
+    Check("咪咕热歌榜返回 >= 3", mgBoardSongs is { Count: >= 3 }, mgBoardSongs?.Count.ToString() ?? "null");
+
+    // 5.4 歌单推荐
+    var mgPlaylists = await LxMiguApi.GetPlaylistsAsync(null, 1);
+    Check("咪咕推荐歌单返回 >= 3", mgPlaylists is { Count: >= 3 }, mgPlaylists?.Count.ToString() ?? "null");
+    if (mgPlaylists is { Count: > 0 })
+    {
+        var mgPl = mgPlaylists[0];
+        Check("推荐歌单 Id 不空", mgPl.Id.Length > 0, mgPl.Id);
+        Check("推荐歌单 Name 不空", mgPl.Name.Length > 0, mgPl.Name);
+        // 5.4a 歌单内歌曲
+        var mgPlSongs = await LxMiguApi.GetPlaylistSongsAsync(mgPl.Id, 1, 20);
+        Check($"歌单「{mgPl.Name}」内歌曲 >= 1", mgPlSongs is { Count: >= 1 }, mgPlSongs?.Count.ToString() ?? "null");
+    }
+
+    // 5.5 歌单分类（可选——咪咕 taglist 结构）
+    var mgTags = await LxMiguApi.GetPlaylistCategoriesAsync();
+    Check("咪咕歌单分类返回 >= 1 组", mgTags is { Count: >= 1 }, mgTags?.Count.ToString() ?? "null");
+
+    // 5.6 歌单搜索
+    var mgPlSearch = await LxMiguApi.SearchPlaylistsAsync("黄诗扶", 1, 12);
+    Check("咪咕歌单搜索至少 1 个", mgPlSearch is { Count: >= 1 }, mgPlSearch?.Count.ToString() ?? "null");
+
+    // 5.7 封面 与 歌词（需真实 songId；失败容忍——仅打印，不算失败）
+    if (mgFirst is not null)
+    {
+        var mgResId = (string)(mgFirst.Internal.TryGetValue("ResId", out var rid) ? rid! : "");
+        if (!string.IsNullOrEmpty(mgResId))
+        {
+            var mgPic = await LxMiguApi.GetPicAsync(mgResId);
+            Console.WriteLine($"  [info] 咪咕封面 pic= {(mgPic ?? "(null)")}");
+        }
+        var lrc = await LxMiguApi.GetLyricAsync(mgFirst);
+        Console.WriteLine($"  [info] 咪咕歌词长度= {(lrc?.Length ?? 0)}{(string.IsNullOrEmpty(lrc) ? "（可能走 mrc / 需 token）" : "")}");
+        Check("咪咕原始歌词可用（lrc 或 mrc 通道）", !string.IsNullOrEmpty(lrc));
+    }
+
+    // 5.8 插件层内置源路由：切到咪咕后歌单/榜单/歌单搜索走 LxMiguApi
+    SetSource("mg");
+    var mgTop = await lxPlugin.GetToplistsAsync();
+    Check("插件 mg 榜单纯列表非空", mgTop is { Count: >= 3 }, mgTop?.Count.ToString() ?? "null");
+    if (mgTop is { Count: > 0 })
+    {
+        Check("插件 mg 榜单 Id=mg__", mgTop[0].Id.StartsWith("mg__"), mgTop[0].Id);
+        Check("插件 mg 榜单名非空", mgTop[0].Name.Length > 0, mgTop[0].Name);
+        // mg 榜单歌曲路由
+        var mgTopSongs = await lxPlugin.GetPlaylistSongsAsync(mgTop[0], 1, 20);
+        Check($"插件 mg 榜单「{mgTop[0].Name}」歌曲 >= 1", mgTopSongs is { Count: >= 1 }, mgTopSongs?.Count.ToString() ?? "null");
+    }
+    var mgPlByPlugin = await lxPlugin.GetPlaylistsAsync(null);
+    Check("插件 mg 歌单返回 >= 1（Id=mg:）",
+        mgPlByPlugin is { Count: >= 1 } && mgPlByPlugin[0].Id.StartsWith("mg:"),
+        mgPlByPlugin?.Count.ToString() ?? "null");
+    var mgPlSearchByPlugin = await lxPlugin.SearchPlaylistsAsync("黄诗扶", 1, 10);
+    Check("插件 mg 歌单搜索 >= 1", mgPlSearchByPlugin is { Count: >= 1 }, mgPlSearchByPlugin?.Count.ToString() ?? "null");
+    SetSource("kw"); // 还原，避免影响后续阶段
+
+    // ── 阶段 6：真实混淆脚本加载（长青SVIP v1.2.0，若文件存在）──
     var realScriptPath = @"C:\Users\lvjin\AppData\Local\Temp\长青SVIP音源(二改修复版) v1.2.0.js";
     if (File.Exists(realScriptPath))
     {
-        Console.WriteLine("\n[phase5] 真实混淆脚本加载（长青SVIP v1.2.0）");
+        Console.WriteLine("\n[phase6] 真实混淆脚本加载（长青SVIP v1.2.0）");
         var realHost = new LxScriptHost();
         var realOk = await realHost.LoadFromFileAsync(realScriptPath);
         // 脚本有 checkUpdate：可能 inited 正常，或检测到新版发 updateAlert
@@ -400,7 +561,7 @@ send(EVENT_NAMES.inited, { status: true, sources: musicSources });
     }
     else
     {
-        Console.WriteLine("\n[phase4] 跳过（未找到长青SVIP 脚本文件）");
+        Console.WriteLine("\n[phase5] 跳过（未找到长青SVIP 脚本文件）");
     }
 }
 finally

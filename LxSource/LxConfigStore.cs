@@ -19,6 +19,9 @@ public class LxConfig
 
     /// <summary>禁用的源短码列表（脚本声明多源时单独启用/关闭；如 ["kg"]）</summary>
     public List<string> DisabledSources { get; set; } = new();
+
+    /// <summary>内置内容源（榜单/歌单/歌单搜索/歌曲搜索的数据来源）：kw=酷我（默认）、mg=咪咕</summary>
+    public string BuiltinSource { get; set; } = "kw";
 }
 
 /// <summary>配置读写：{LocalApplicationData}/CatClawMusic.Maui/lx_source_config.json</summary>

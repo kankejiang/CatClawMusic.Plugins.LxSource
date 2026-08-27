@@ -35,7 +35,7 @@ public static class LxUiKit
         };
         coverBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
         var coverImage = new Image { Aspect = Aspect.AspectFill, WidthRequest = 40, HeightRequest = 40 };
-        coverImage.SetBinding(Image.SourceProperty, new Binding(nameof(OnlineSong.CoverUrl), converter: OnlineUrlToStreamImageConverter.Instance) { TargetNullValue = "ic_music_note" });
+        coverImage.SetBinding(Image.SourceProperty, new Binding(nameof(OnlineSong.CoverUrl), converter: OnlineUrlToImageSourceConverter.Instance) { TargetNullValue = "ic_music_note" });
         coverBorder.Content = coverImage;
 
         var titleLabel = new Label { FontSize = 14, FontFamily = "OpenSansSemibold", MaxLines = 1 };
@@ -183,7 +183,7 @@ public static class LxUiKit
                 WidthRequest = 100,
             };
             coverImage.SetBinding(Image.SourceProperty, new Binding(nameof(OnlinePlaylist.CoverUrl),
-                converter: OnlineUrlToStreamImageConverter.Instance) { TargetNullValue = "ic_music_note" });
+                converter: OnlineUrlToImageSourceConverter.Instance) { TargetNullValue = "ic_music_note" });
 
             var countBadge = new Label
             {
@@ -202,7 +202,6 @@ public static class LxUiKit
             {
                 StrokeThickness = 0,
                 StrokeShape = new RoundRectangle { CornerRadius = 12 },
-                Clip = new RoundRectangleGeometry { CornerRadius = 12 },
                 HeightRequest = 100,
             };
             coverBorder.SetDynamicResource(Border.BackgroundColorProperty, "SurfaceColor");
@@ -260,41 +259,35 @@ public static class LxUiKit
             => throw new NotSupportedException();
     }
 
-    /// <summary>在线 URL → 内存 Stream 封面（不落盘缓存，内存字典去重防重复下载）</summary>
-    private sealed class OnlineUrlToStreamImageConverter : IValueConverter
+    /// <summary>在线 URL → UriImageSource（平台图片加载器负责下载与缓存）。
+    /// 非法/空 URL 回落占位图标；http 自动升 https（酷我/咪咕 CDN 均支持）。
+    /// 注意不能用 ImageSource.FromStream：Android Release 构建存在流图片不显示的已知 bug
+    /// （dotnet/maui #25283/#30734），且大图无采样易触发 too-large-bitmap 崩溃。</summary>
+    private sealed class OnlineUrlToImageSourceConverter : IValueConverter
     {
-        public static readonly OnlineUrlToStreamImageConverter Instance = new();
-        private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
-        private static readonly ConcurrentDictionary<string, byte[]> MemCache = new();
-        private static readonly ConcurrentDictionary<string, Task<byte[]?>> Inflight = new();
+        public static readonly OnlineUrlToImageSourceConverter Instance = new();
 
         public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
         {
             var url = value as string;
             if (string.IsNullOrWhiteSpace(url)) return "ic_music_note";
-            return ImageSource.FromStream(ct => LoadAsync(url, ct));
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                return "ic_music_note";
+            if (uri.Scheme == Uri.UriSchemeHttp)
+            {
+                // 酷我封面貌似 URL 自带显式 :80 端口（如 http://img4.kuwo.cn:80/...）。
+                // 直接改 Scheme 会得到 https://host:80 —— https 连 80 端口必然超时，
+                // 造成大量图片加载失败（"Unable to load image stream"/TaskCanceled）与卡顿。
+                // 必须把端口重置为默认（-1 → https 默认 443）。
+                var ub = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttps, Port = -1 };
+                uri = ub.Uri;
+            }
+            return ImageSource.FromUri(uri);
         }
 
         public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
             => throw new NotSupportedException();
-
-        private static async Task<Stream> LoadAsync(string url, CancellationToken ct)
-        {
-            if (!MemCache.TryGetValue(url, out var bytes))
-            {
-                var task = Inflight.GetOrAdd(url, _ => DownloadAsync(url));
-                try { bytes = await task.ConfigureAwait(false); }
-                finally { Inflight.TryRemove(url, out _); }
-                if (bytes is { Length: > 0 }) MemCache[url] = bytes;
-            }
-            return new MemoryStream(bytes ?? Array.Empty<byte>());
-        }
-
-        private static async Task<byte[]?> DownloadAsync(string url)
-        {
-            try { return await Http.GetByteArrayAsync(url).ConfigureAwait(false); }
-            catch { return null; }
-        }
     }
 }
 
@@ -305,5 +298,92 @@ internal static class GridColumnExtensions
     {
         Grid.SetColumn(view, column);
         return view;
+    }
+}
+
+/// <summary>跨环境页面导航。Android 始终在 Shell 内，常规压/弹栈即可；
+/// Windows 桌面宿主是 Window(DesktopBlankPage)（无 Shell，直接取 Shell.Current 会抛
+/// InvalidOperationException），须反射调用宿主 DesktopNavigation.PushEmbed/PopOrClose
+/// 把页面嵌入主区域（宿主自己的二级页同样走这条路），反射不可用再回落 MainPage 模态。</summary>
+internal static class LxNav
+{
+    /// <summary>打开页面：Shell 环境压栈；桌面嵌入主区域；都不可用则模态兜底。</summary>
+    public static async Task PushAsync(Page page)
+    {
+        if (!MainThread.IsMainThread)
+        {
+            await MainThread.InvokeOnMainThreadAsync(() => PushCoreAsync(page));
+            return;
+        }
+        await PushCoreAsync(page);
+    }
+
+    /// <summary>返回：页面在模态栈则弹模态；Shell 环境弹导航栈；桌面关闭嵌入页。</summary>
+    public static async Task PopAsync(Page page)
+    {
+        if (!MainThread.IsMainThread)
+        {
+            await MainThread.InvokeOnMainThreadAsync(() => PopCoreAsync(page));
+            return;
+        }
+        await PopCoreAsync(page);
+    }
+
+    private static async Task PushCoreAsync(Page page)
+    {
+        if (TryGetShell()?.Navigation is { } nav)
+        {
+            try { await nav.PushAsync(page); } catch { }
+            return;
+        }
+        if (TryHostNavigate("PushEmbed", page)) return;
+        var root = Application.Current?.MainPage;
+        if (root != null)
+        {
+            try { await root.Navigation.PushModalAsync(page); } catch { }
+        }
+    }
+
+    private static async Task PopCoreAsync(Page page)
+    {
+        try
+        {
+            var root = Application.Current?.MainPage;
+            if (root?.Navigation.ModalStack.Contains(page) == true)
+            {
+                await root.Navigation.PopModalAsync();
+                return;
+            }
+        }
+        catch { }
+        if (TryGetShell()?.Navigation is { } nav && nav.NavigationStack.Count > 1)
+        {
+            try { await nav.PopAsync(); } catch { }
+            return;
+        }
+        TryHostNavigate("PopOrClose", null);
+    }
+
+    private static Shell? TryGetShell()
+    {
+        try { return Shell.Current; }
+        catch { return null; }
+    }
+
+    /// <summary>反射调用宿主 CatClawMusic.Maui 的 DesktopNavigation 静态方法。
+    /// 插件只引用 CatClawMusic.Core，拿不到宿主 MAUI 层类型，用反射桥接。</summary>
+    private static bool TryHostNavigate(string methodName, Page? page)
+    {
+        try
+        {
+            var asm = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => string.Equals(a.GetName().Name, "CatClawMusic.Maui", StringComparison.Ordinal));
+            var method = asm?.GetType("CatClawMusic.Maui.Helpers.DesktopNavigation")?
+                .GetMethod(methodName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (method == null) return false;
+            method.Invoke(null, page != null ? new object?[] { page } : null);
+            return true;
+        }
+        catch { return false; }
     }
 }

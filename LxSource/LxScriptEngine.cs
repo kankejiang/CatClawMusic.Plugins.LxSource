@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Numerics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
@@ -508,13 +509,81 @@ public class LxCryptoUtils
         catch { return Array.Empty<byte>(); }
     }
 
-    // AES / RSA —— 阶段 2 实现；这里抛明确异常，让调用方知道脚本用了未支持能力
+    // AES / RSA —— 对齐 lx 脚本 SDK（参照 lx-music user-api-preload）。
+    // 输入/输出均为字节数组（byte[]，经 Jint 包装）；字符串按 UTF-8 转字节、数组按原样取字节，
+    // 与 utils.buffer 的约定一致（lx 的 dataToB64 对字符串做 UTF-8→base64，等价于 UTF-8 字节）。
     public object aesEncrypt(JsValue data, JsValue mode, JsValue key, JsValue iv)
-        => throw new NotSupportedException("utils.crypto.aesEncrypt 未实现（计划阶段 2）");
+        => AesBytes(LxBufferUtils.ToBytes(data), mode.AsString(), LxBufferUtils.ToBytes(key), LxBufferUtils.ToBytes(iv), encrypt: true);
+
     public object aesDecrypt(JsValue data, JsValue mode, JsValue key, JsValue iv)
-        => throw new NotSupportedException("utils.crypto.aesDecrypt 未实现（计划阶段 2）");
+        => AesBytes(LxBufferUtils.ToBytes(data), mode.AsString(), LxBufferUtils.ToBytes(key), LxBufferUtils.ToBytes(iv), encrypt: false);
+
     public object rsaEncrypt(JsValue data, JsValue key)
-        => throw new NotSupportedException("utils.crypto.rsaEncrypt 未实现（计划阶段 2）");
+    {
+        var plain = LxBufferUtils.ToBytes(data);
+        var pubKey = key.IsString() ? key.AsString() : "";
+        // 剥去 PEM 头尾（lx 允许带 BEGIN/END PUBLIC KEY 或裸 base64 的 SubjectPublicKeyInfo）
+        pubKey = pubKey
+            .Replace("-----BEGIN PUBLIC KEY-----", "")
+            .Replace("-----END PUBLIC KEY-----", "")
+            .Replace("-----BEGIN RSA PUBLIC KEY-----", "")
+            .Replace("-----END RSA PUBLIC KEY-----", "")
+            .Replace("\n", "").Replace("\r", "").Replace(" ", "");
+        if (string.IsNullOrWhiteSpace(pubKey))
+            throw new ArgumentException("utils.crypto.rsaEncrypt: invalid RSA public key");
+        var der = Convert.FromBase64String(pubKey);
+        using var rsa = RSA.Create();
+        try { rsa.ImportSubjectPublicKeyInfo(der, out _); }
+        catch (CryptographicException) { rsa.ImportRSAPublicKey(der, out _); }
+        return RsaRawEncrypt(plain, rsa.ExportParameters(false));
+    }
+
+    /// <summary>RSA/ECB/NoPadding（裸指数运算）：cipher = plain^E mod N，等长输出（大端、左补零到模长）。</summary>
+    private static byte[] RsaRawEncrypt(byte[] plain, RSAParameters pub)
+    {
+        if (pub.Modulus == null || pub.Exponent == null) throw new InvalidOperationException("RSA public key missing");
+        var k = pub.Modulus.Length;
+        var n = new BigInteger(pub.Modulus, isUnsigned: true, isBigEndian: true);
+        var e = new BigInteger(pub.Exponent, isUnsigned: true, isBigEndian: true);
+        var m = new BigInteger(plain, isUnsigned: true, isBigEndian: true);
+        var c = BigInteger.ModPow(m, e, n);
+        var raw = c.ToByteArray(isUnsigned: true, isBigEndian: true);
+        // NoPadding 要求密文等长于模长；不足左侧补零
+        if (raw.Length < k)
+        {
+            var padded = new byte[k];
+            Buffer.BlockCopy(raw, 0, padded, k - raw.Length, raw.Length);
+            return padded;
+        }
+        return raw;
+    }
+
+    private static byte[] AesBytes(byte[] data, string mode, byte[] key, byte[] iv, bool encrypt)
+    {
+        using var aes = Aes.Create();
+        aes.Mode = mode.EndsWith("ecb", StringComparison.OrdinalIgnoreCase) ? CipherMode.ECB : CipherMode.CBC;
+        aes.Padding = PaddingMode.PKCS7;
+        aes.KeySize = 128;
+        aes.Key = Pad16(key);
+        // ECB 无 IV；CBC 用不足 16 字节时补零的 IV（lx 脚本 IV 均为 16 字节）
+        aes.IV = aes.Mode == CipherMode.ECB ? new byte[16] : Pad16(iv);
+        var transform = encrypt ? aes.CreateEncryptor() : aes.CreateDecryptor();
+        using var ms = new MemoryStream();
+        using (var cs = new CryptoStream(ms, transform, CryptoStreamMode.Write))
+        {
+            cs.Write(data, 0, data.Length);
+            cs.FlushFinalBlock();
+        }
+        return ms.ToArray();
+    }
+
+    private static byte[] Pad16(byte[] b)
+    {
+        // 截断到 16、不足补零，保证 key/iv 长度恒为 16（AES-128）
+        var padded = new byte[16];
+        Buffer.BlockCopy(b, 0, padded, 0, Math.Min(b.Length, 16));
+        return padded;
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -802,14 +802,7 @@ public class LxOnlineMusicPage : ContentPage
         label.SetDynamicResource(Label.TextColorProperty, "TextPrimaryColor");
         btn.Content = label;
         var tap = new TapGestureRecognizer();
-        tap.Tapped += async (_, _) =>
-        {
-            try
-            {
-                if (Shell.Current?.Navigation != null) await Shell.Current.Navigation.PopAsync();
-            }
-            catch { }
-        };
+        tap.Tapped += async (_, _) => await LxNav.PopAsync(this);
         btn.GestureRecognizers.Add(tap);
         return btn;
     }

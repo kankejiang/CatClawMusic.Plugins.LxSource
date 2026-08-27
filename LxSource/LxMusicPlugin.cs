@@ -28,7 +28,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     public string PluginId => "lxSource";
     public string Name => "LX 源音乐";
-    public string Version => "0.4.1";
+    public string Version => "0.4.2";
     public string Author => "CatClawMusic";
     public string Description => "内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本（在线/本地导入）：支持网易云/QQ/酷我/酷狗等，播放直链/歌词（原文+翻译+罗马音）/封面/多音质";
     public List<string> Capabilities => new() { "search", "play", "lyrics", "roma", "quality", "script" };
@@ -59,6 +59,8 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     public Task InitializeAsync()
     {
         _config = LxConfigStore.Load();
+        // 恢复内置内容源（酷我/咪咕）
+        BuiltinSource = _config.BuiltinSource switch { "mg" => "mg", _ => "kw" };
         // 恢复上次导入的脚本（本地优先，文件不在则试在线地址）
         if (!string.IsNullOrWhiteSpace(_config.ScriptFilePath) && File.Exists(_config.ScriptFilePath))
             _ = LoadScriptFromFileAsync(_config.ScriptFilePath);
@@ -166,6 +168,18 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     // ── IOnlineMusicPlugin ──
 
+    /// <summary>内置内容源（榜单/歌单/歌单搜索的数据来源）：kw=酷我（默认）、mg=咪咕。<see cref="SetBuiltinSource"/> 切换。</summary>
+    public string BuiltinSource { get; private set; } = "kw";
+
+    /// <summary>切换到咪咕或酷我内置内容源并持久化。空值/未知码回退酷我。</summary>
+    public void SetBuiltinSource(string code)
+    {
+        var c = (code ?? "").Trim().ToLowerInvariant();
+        BuiltinSource = c switch { "mg" or "kw" => c, _ => "kw" };
+        _config.BuiltinSource = BuiltinSource;
+        LxConfigStore.Save(_config);
+    }
+
     /// <summary>搜索歌曲（结果带封面；仅脚本 musicSearch action）。脚本不支持则返回 null</summary>
     public async Task<List<OnlineSong>?> SearchAsync(string keyword, int page = 1, int pageSize = 20)
     {
@@ -267,9 +281,13 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     public async Task<List<OnlinePlaylist>> GetPlaylistsAsync(string? category = null)
     {
-        // 若未加载脚本，也不影响：歌单、榜单、搜索全部走内置酷我 API
+        // 若未加载脚本，也不影响：歌单、榜单、搜索全部走内置 API
         // category == null：推荐歌单（默认最热）；否则：分类标签id
-        var r = await LxKuwoApi.GetPlaylistsAsync(category, page: 1, pageSize: 20, sort: "hot").ConfigureAwait(false);
+        List<OnlinePlaylist>? r;
+        if (BuiltinSource == "mg")
+            r = await LxMiguApi.GetPlaylistsAsync(null, 1).ConfigureAwait(false);
+        else
+            r = await LxKuwoApi.GetPlaylistsAsync(category, page: 1, pageSize: 20, sort: "hot").ConfigureAwait(false);
         // Fail-safe：若 API 偶发失败，返回空列表而不是 null，接口契约是 Task<List<OnlinePlaylist>>
         return r ?? new List<OnlinePlaylist>();
     }
@@ -277,24 +295,42 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     /// <summary>最新歌单（非接口方法，UI 里「最新/最热」切换时调用）。</summary>
     public async Task<List<OnlinePlaylist>> GetPlaylistsNewAsync(string? category = null, int page = 1, int pageSize = 20)
     {
-        var r = await LxKuwoApi.GetPlaylistsAsync(category, page, pageSize, sort: "new").ConfigureAwait(false);
+        List<OnlinePlaylist>? r;
+        if (BuiltinSource == "mg")
+            r = await LxMiguApi.GetPlaylistsAsync(category, page).ConfigureAwait(false);
+        else
+            r = await LxKuwoApi.GetPlaylistsAsync(category, page, pageSize, sort: "new").ConfigureAwait(false);
         return r ?? new List<OnlinePlaylist>();
     }
 
     /// <summary>歌单搜索（对应图里搜索页的「歌单」tab，插件侧扩展方法，宿主会用反射/适配调用）。</summary>
     public async Task<List<OnlinePlaylist>?> SearchPlaylistsAsync(string keyword, int page = 1, int pageSize = 20)
-        => await LxKuwoApi.SearchPlaylistsAsync(keyword, page, pageSize).ConfigureAwait(false);
+        => BuiltinSource == "mg"
+            ? await LxMiguApi.SearchPlaylistsAsync(keyword, page, pageSize).ConfigureAwait(false)
+            : await LxKuwoApi.SearchPlaylistsAsync(keyword, page, pageSize).ConfigureAwait(false);
 
-    /// <summary>榜单（排行榜页：飙升榜/新歌榜/热歌榜/抖音热歌榜…）。
-    /// 项 Id="kw__&lt;bangId&gt;"，<see cref="GetPlaylistSongsAsync"/> 据此切换到 kbangserver 拉榜单歌曲。</summary>
+    /// <summary>榜单（排行榜页：飙升榜/新歌榜/热歌榜…）。
+    /// 项 Id="kw__&lt;bangId&gt;" 或 "mg__&lt;bangid&gt;"，<see cref="GetPlaylistSongsAsync"/> 据此切换对应接口拉取歌曲。</summary>
     public async Task<List<OnlinePlaylist>> GetToplistsAsync()
     {
-        var boards = LxKuwoApi.GetBoards();
-        // 并行拉 25 个榜单头信息（每个请求极小 ~1KB），比串行快 10x+
-        var tasks = new Task<(LxBoardItem Board, (string Name, string? Cover, string? Info, int Num)? Head)>[boards.Count];
-        for (var i = 0; i < boards.Count; i++)
+        if (BuiltinSource == "mg")
         {
-            var b = boards[i];
+            var boards = LxMiguApi.GetBoards();
+            return boards.Select(b => new OnlinePlaylist
+            {
+                Id = b.Id,
+                Platform = "lx",
+                Name = b.Name,
+                Description = $"咪咕音乐 · {b.Name}",
+            }).ToList();
+        }
+
+        var kwBoards = LxKuwoApi.GetBoards();
+        // 并行拉 25 个榜单头信息（每个请求极小 ~1KB），比串行快 10x+
+        var tasks = new Task<(LxBoardItem Board, (string Name, string? Cover, string? Info, int Num)? Head)>[kwBoards.Count];
+        for (var i = 0; i < kwBoards.Count; i++)
+        {
+            var b = kwBoards[i];
             tasks[i] = WrapHead(b);
         }
         static async Task<(LxBoardItem Board, (string Name, string? Cover, string? Info, int Num)? Head)> WrapHead(LxBoardItem bb)
@@ -324,6 +360,10 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
     public async Task<List<OnlineSong>?> GetPlaylistSongsAsync(OnlinePlaylist playlist, int page = 1, int pageSize = 50)
     {
         if (playlist == null || string.IsNullOrWhiteSpace(playlist.Id)) return null;
+        // 按 Id 前缀路由：mg: / mg__ → 咪咕；其余 → 酷我
+        if (playlist.Id.StartsWith("mg:", StringComparison.OrdinalIgnoreCase) ||
+            playlist.Id.StartsWith("mg__", StringComparison.OrdinalIgnoreCase))
+            return await LxMiguApi.GetPlaylistSongsAsync(playlist.Id, page, pageSize).ConfigureAwait(false);
         return await LxKuwoApi.GetPlaylistSongsAsync(playlist.Id, page, pageSize).ConfigureAwait(false);
     }
 
