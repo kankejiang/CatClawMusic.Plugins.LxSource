@@ -12,45 +12,10 @@ using Jint.Native.Object;
 namespace CatClawMusic.Plugins.LxSource;
 
 // ──────────────────────────────────────────────────────────────────────────
-//  Jint 引擎加载器：从嵌入资源加载 Jint.dll / Acornima.dll
+//  Jint 运行时说明：宿主统一提供（宿主 DI 的 IJsRuntimeService，Jint/Acornima
+//  随宿主 App 分发、默认 ALC 原生解析）。插件不再嵌入 Jint.dll/Acornima.dll，
+//  仅编译期引用其 API。见 LxMusicPlugin.LxHostServices。
 // ──────────────────────────────────────────────────────────────────────────
-
-/// <summary>
-/// 把嵌入资源的 Jint.dll / Acornima.dll 在首次需要时通过 AppDomain.AssemblyResolve
-/// 加载进 AppDomain。插件 .ccp 是单 DLL、宿主不提供 Jint，故必须自加载。
-/// <para>契约：插件类型不得继承/字段签名引用 Jint 类型——只能在方法体内引用，
-/// 否则宿主 GetTypes() 阶段 JIT 解析类型时会早于本加载器注册而失败。</para>
-/// </summary>
-public static class LxScriptEngineLoader
-{
-    private static readonly Dictionary<string, string> ResByName = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["Jint"] = "Jint.dll",
-        ["Acornima"] = "Acornima.dll",
-    };
-
-    private static int _registered;
-
-    /// <summary>注册 AssemblyResolve 处理器（幂等）。由 ModuleInitializer 调用。</summary>
-    [ModuleInitializer]
-    internal static void Register()
-    {
-        if (Interlocked.CompareExchange(ref _registered, 1, 0) != 0) return;
-        AppDomain.CurrentDomain.AssemblyResolve += OnAssemblyResolve;
-    }
-
-    private static Assembly? OnAssemblyResolve(object? sender, ResolveEventArgs args)
-    {
-        var name = new AssemblyName(args.Name).Name ?? "";
-        if (!ResByName.TryGetValue(name, out var resName)) return null;
-        var asm = typeof(LxScriptEngineLoader).Assembly;
-        using var stream = asm.GetManifestResourceStream(resName);
-        if (stream == null) return null;
-        using var ms = new MemoryStream((int)stream.Length);
-        stream.CopyTo(ms);
-        return Assembly.Load(ms.ToArray());
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────
 //  平台码映射：lx 短码（wy/kw/kg/tx/mg）↔ lx-music-api-server 全名（netease/...）
@@ -679,9 +644,24 @@ public class LxScriptHost : IDisposable
         LxBridge bridge;
         lock (_scriptLock)
         {
-            engine = new Engine(opts => opts
-                .LimitRecursion(5000)
-                .TimeoutInterval(TimeSpan.FromSeconds(8)));
+            // JS 运行时由宿主统一提供（IJsRuntimeService）：统一约束创建引擎；
+            // 服务缺失（宿主版本过旧）时给出明确的升级提示，不静默失败。
+            var js = LxHostServices.JsRuntime;
+            if (js == null)
+            {
+                LastError = "JS 运行时不可用——宿主版本过旧，请升级猫爪音乐后重装本插件";
+                return false;
+            }
+            try
+            {
+                js.EnsureLoaded();
+            }
+            catch (Exception ex)
+            {
+                LastError = "JS 运行时加载失败：" + ex.Message;
+                return false;
+            }
+            engine = js.CreateEngine(TimeSpan.FromSeconds(8));
             bridge = new LxBridge(engine);
             _engine = engine;
             _bridge = bridge;

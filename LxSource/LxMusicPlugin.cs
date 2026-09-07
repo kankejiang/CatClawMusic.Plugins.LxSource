@@ -4,6 +4,35 @@ using CatClawMusic.Core.Models;
 namespace CatClawMusic.Plugins.LxSource;
 
 /// <summary>
+/// 插件宿主服务定位器：CreateEntryPage 时捕获宿主 IServiceProvider（未经过入口页时
+/// 从 MAUI 应用 DI 容器兜底），LxScriptHost 统一经 <see cref="JsRuntime"/> 解析
+/// 宿主统一 JS 运行时（Jint/Acornima 随宿主分发，插件不再自嵌）。
+/// </summary>
+internal static class LxHostServices
+{
+    private static IServiceProvider? _services;
+
+    /// <summary>宿主 IServiceProvider（CreateEntryPage 时注入；读取时自动兜底解析）</summary>
+    public static IServiceProvider? Services
+    {
+        get => _services ??= ResolveAppServices();
+        set => _services = value;
+    }
+
+    /// <summary>从当前 MAUI 应用取宿主 DI 容器（跨平台，任何上下文可用）</summary>
+    private static IServiceProvider? ResolveAppServices()
+    {
+        try { return Microsoft.Maui.IPlatformApplication.Current?.Services; }
+        catch { return null; }
+    }
+
+    /// <summary>宿主统一 JS 运行时（宿主版本过旧时为 null → 上层给出升级提示）</summary>
+    public static CatClawMusic.Core.Interfaces.IJsRuntimeService? JsRuntime =>
+        Services?.GetService(typeof(CatClawMusic.Core.Interfaces.IJsRuntimeService))
+            as CatClawMusic.Core.Interfaces.IJsRuntimeService;
+}
+
+/// <summary>
 /// LX 源音乐插件：内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本，支持在线导入与本地导入。
 /// 脚本声明源（kg/tx/wy/kw 等）与 action（musicUrl/musicSearch/lyric/pic），插件按声明分发。
 /// <para>
@@ -28,7 +57,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     public string PluginId => "lxSource";
     public string Name => "LX 源音乐";
-    public string Version => "0.4.2";
+    public string Version => "0.4.3";
     public string Author => "CatClawMusic";
     public string Description => "内嵌 Jint 引擎运行 lx-music 自定义源 .js 脚本（在线/本地导入）：支持网易云/QQ/酷我/酷狗等，播放直链/歌词（原文+翻译+罗马音）/封面/多音质";
     public List<string> Capabilities => new() { "search", "play", "lyrics", "roma", "quality", "script" };
@@ -43,6 +72,7 @@ public class LxMusicPlugin : IOnlineMusicPlugin, IViewContributorPlugin, ILyrics
 
     public object CreateEntryPage(IServiceProvider services)
     {
+        LxHostServices.Services = services;   // 捕获宿主服务（LxScriptHost 经此解析 IJsRuntimeService）
         var vm = GetSharedVm(services);
         return new LxOnlineMusicPage(vm, services);
     }

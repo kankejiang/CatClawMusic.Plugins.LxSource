@@ -22,39 +22,17 @@
     <PackageReference Include="Microsoft.Maui.Controls" Version="11.0.0-preview.7.26406.9" />
     <!-- MVVM Toolkit：插件 ViewModel 使用 ObservableObject/RelayCommand -->
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
-    <!-- Jint JS 引擎：运行 lx-music 自定义源 .js。以嵌入资源分发（不随插件输出 DLL），
-         编译期用其 API；运行期由插件 AssemblyResolve 从嵌入资源流加载 Jint.dll + Acornima.dll。
-         Acornima 是 Jint 的解析器依赖，显式直接引用以拿到 PkgAcornima 路径属性。 -->
+    <!-- Jint JS 引擎：运行 lx-music 自定义源 .js。仅编译期引用 API（不随插件输出、不嵌入资源）；
+         运行期由宿主统一提供（宿主 Core 的 Jint/Acornima 随 App 分发），经宿主 DI 的
+         IJsRuntimeService 创建引擎。Acornima 是 Jint 的解析器依赖，显式引用以锁定版本。 -->
     <PackageReference Include="Jint" Version="4.16.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>Compile;Analyzers</IncludeAssets>
-      <GeneratePathProperty>true</GeneratePathProperty>
     </PackageReference>
     <PackageReference Include="Acornima" Version="1.7.0">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>Compile;Analyzers</IncludeAssets>
-      <GeneratePathProperty>true</GeneratePathProperty>
     </PackageReference>
-  </ItemGroup>
-
-  <!-- 把 Jint.dll / Acornima.dll 嵌入插件程序集资源（LogicalName 固定，运行期按名读取）。
-       net10.0 优先，回落 net8.0（net10 可加载 net8 程序集）。 -->
-  <!-- 把 Jint.dll / Acornima.dll 嵌入插件程序集资源（LogicalName 固定，运行期按名读取）。
-       静态项在 eval 阶段求值，$(PkgJint)/$(PkgAcornima) 由 restore 生成的 .g.props 提供。
-       net10.0 优先，回落 net8.0（net10 可加载 net8 程序集）。 -->
-  <ItemGroup>
-    <EmbeddedResource Include="$(PkgJint)\lib\net10.0\Jint.dll"
-                     Condition="'$(PkgJint)' != '' And Exists('$(PkgJint)\lib\net10.0\Jint.dll')"
-                     LogicalName="Jint.dll" />
-    <EmbeddedResource Include="$(PkgJint)\lib\net8.0\Jint.dll"
-                     Condition="'$(PkgJint)' != '' And !Exists('$(PkgJint)\lib\net10.0\Jint.dll') And Exists('$(PkgJint)\lib\net8.0\Jint.dll')"
-                     LogicalName="Jint.dll" />
-    <EmbeddedResource Include="$(PkgAcornima)\lib\net10.0\Acornima.dll"
-                     Condition="'$(PkgAcornima)' != '' And Exists('$(PkgAcornima)\lib\net10.0\Acornima.dll')"
-                     LogicalName="Acornima.dll" />
-    <EmbeddedResource Include="$(PkgAcornima)\lib\net8.0\Acornima.dll"
-                     Condition="'$(PkgAcornima)' != '' And !Exists('$(PkgAcornima)\lib\net10.0\Acornima.dll') And Exists('$(PkgAcornima)\lib\net8.0\Acornima.dll')"
-                     LogicalName="Acornima.dll" />
   </ItemGroup>
 
   <ItemGroup>
