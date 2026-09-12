@@ -21,3 +21,14 @@ Thumbs.db
 .codebuddy/
 CLAUDE.md
 AGENTS.md
+
+# ---- AI 工具产物（本地缓存/记忆，不入库） ----
+.codeium/
+.gemini/
+.windsurf/
+.aider*
+.cline*
+.continue/
+.openclaw*
+.autoclaw*
+CLAUDE.local.md
