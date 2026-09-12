@@ -11,3 +11,13 @@ obj/
 ## OS
 Thumbs.db
 .DS_Store
+
+## AI 工具本地记忆/产物（不入库）
+.workbuddy/
+.trae/
+.reasonix/
+.claude/
+.cursor/
+.codebuddy/
+CLAUDE.md
+AGENTS.md
