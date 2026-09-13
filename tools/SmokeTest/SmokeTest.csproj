@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <!-- 直接编译插件源码（不依赖 MAUI），验证协议客户端与歌词解析 -->
+    <Compile Include="..\Shared\LxHostServicesStub.cs" Link="LxHostServicesStub.cs" />
     <Compile Include="..\..\LxSource\LxApiClient.cs" Link="LxApiClient.cs" />
     <Compile Include="..\..\LxSource\LxLrcParser.cs" Link="LxLrcParser.cs" />
     <Compile Include="..\..\LxSource\LxScriptEngine.cs" Link="LxScriptEngine.cs" />

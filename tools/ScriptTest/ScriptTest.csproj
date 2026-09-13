@@ -10,6 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\LxHostServicesStub.cs" Link="LxHostServicesStub.cs" />
     <Compile Include="..\..\LxSource\LxScriptEngine.cs" Link="LxScriptEngine.cs" />
     <Compile Include="..\..\LxSource\LxKuwoApi.cs" Link="LxKuwoApi.cs" />
     <ProjectReference Include="..\..\..\CatClawMusic\CatClawMusic.Core\CatClawMusic.Core.csproj" />
